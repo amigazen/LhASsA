@@ -10,6 +10,7 @@ FROM     StartUp.o
          lh_datetime.o
          lh_codec.o
          lh_lh5dec.o
+         lh_lh5enc.o
          lh_lh1dec.o
          lh_charset.o
          lh_header.o

@@ -23,8 +23,8 @@
  * (legacy 0x3F + UTF-16 0x46) with nested level-2 paths.
  *
  * Regressions (CheckPoint / lh5 writer fixes):
- *   - LHADD_Method lh5 add must not fail with LhErr 223; library may
- *     fall back to lh0 when compress fails or expands
+ *   - LHADD_Method lh5 add must round-trip via real st1 encoder/decoder;
+ *     library may still fall back to lh0 when compress expands
  *   - All-identical / Prefs-sized payloads must finish (lh5 EOF hang)
  *   - Larger patterned payloads must finish (no lh5 hash-chain hang)
  *   - Many sequential lh5+snapshot adds (CheckSys Prefs.lha shape)

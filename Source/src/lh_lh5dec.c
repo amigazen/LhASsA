@@ -115,6 +115,9 @@ static void lh5_make_table(
         weight[i] = (unsigned short)(1 << (16 - i));
     }
     for (i = 0; i < (unsigned int)nchar; i++) {
+        if (bitlen[i] > 16) {
+            return;
+        }
         count[bitlen[i]]++;
     }
     total = 0;
@@ -153,9 +156,19 @@ static void lh5_make_table(
             n = k - tablebits;
             while (--n >= 0) {
                 if (*p == 0) {
+                    /*
+                     * Corrupt/non-LH5 bit lengths can grow the tree past
+                     * left/right[]; abort instead of smashing the pool.
+                     */
+                    if (avail >= (2 * LH5_NC - 1)) {
+                        return;
+                    }
                     d->right[avail] = 0;
                     d->left[avail] = 0;
                     *p = (unsigned short)avail++;
+                }
+                if (*p >= (unsigned short)(2 * LH5_NC - 1)) {
+                    return;
                 }
                 if (i & 0x8000u) {
                     p = &d->right[*p];

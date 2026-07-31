@@ -720,9 +720,7 @@ lh_status lh_writer_add(
     rc = lh_codec_compress((void *)data, (unsigned long)data_len,
         packed, (unsigned long *)&packed_len, (long)method);
     /*
-     * The simplified lh5 encoder can emit a stream the real decoder
-     * rejects.  Verify a round-trip before committing compressed bytes;
-     * otherwise fall through to -lh0- store (same as expand/fail).
+     * If compress fails, expands, or fails a decode verify, store as -lh0-.
      */
     if (rc == 0 && packed_len < data_len && method != LH_METHOD_LH0) {
         unsigned char *verify;
@@ -741,11 +739,6 @@ lh_status lh_writer_add(
             free(verify);
         }
     }
-    /*
-     * Classic LHA behaviour: if compress fails or does not shrink, store
-     * as -lh0-.  Also avoids LhErr 223 (WRITE_PROTECTED catch-all) when
-     * the simplified lh5 encoder expands or errors on Amiga.
-     */
     if (rc != 0 || packed_len >= data_len) {
         method = LH_METHOD_LH0;
         strncpy(meta->method_sig, lh_method_to_string(method), LH_SIG_LEN);

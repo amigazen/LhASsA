@@ -24,28 +24,54 @@ static void expect_ok(const char *label, lh_status st)
 
 static void test_codec_roundtrip(void)
 {
-    const char *plain = "LhASsA smoke test payload for lh5 roundtrip.";
+    unsigned char *plain;
     unsigned char out[4096];
-    unsigned char back[512];
+    unsigned char back[2048];
     size_t out_len;
+    size_t plain_len;
     lh_status st;
+    size_t i;
 
-    out_len = sizeof(out);
-    st = lh_compress(LH_METHOD_LH5,
-        (const unsigned char *)plain, strlen(plain), out, &out_len);
-    expect_ok("lh5 compress", st);
-    if (st == LH_OK && out_len > 0) {
-        /* LH5 roundtrip pending codec header/bitstream alignment fix. */
-        puts("lh5: compress ok (roundtrip deferred)");
+    /* Real LH5 needs enough input to beat Huffman table overhead. */
+    plain_len = 2048;
+    plain = (unsigned char *)malloc(plain_len);
+    if (plain == NULL) {
+        fprintf(stderr, "FAIL lh5 AllocMem\n");
+        fail_count++;
+        return;
+    }
+    for (i = 0; i < plain_len; i++) {
+        plain[i] = (unsigned char)(0x55);
     }
 
     out_len = sizeof(out);
-    st = lh_compress(LH_METHOD_LH0,
-        (const unsigned char *)plain, strlen(plain), out, &out_len);
-    expect_ok("lh0 compress", st);
+    st = lh_compress(LH_METHOD_LH5, plain, plain_len, out, &out_len);
+    expect_ok("lh5 compress", st);
     memset(back, 0, sizeof(back));
-    st = lh_decompress(LH_METHOD_LH0, out, out_len, strlen(plain), back, sizeof(back));
-    expect_ok("lh0 decompress", st);
+    st = lh_decompress(LH_METHOD_LH5, out, out_len, plain_len, back,
+        plain_len);
+    expect_ok("lh5 decompress", st);
+    if (st == LH_OK && memcmp(plain, back, plain_len) != 0) {
+        fprintf(stderr, "FAIL lh5 data mismatch\n");
+        fail_count++;
+    } else if (st == LH_OK) {
+        puts("lh5: roundtrip ok");
+    }
+    free(plain);
+
+    {
+        const char *short_plain = "LhASsA smoke test payload for lh0.";
+
+        out_len = sizeof(out);
+        st = lh_compress(LH_METHOD_LH0,
+            (const unsigned char *)short_plain, strlen(short_plain),
+            out, &out_len);
+        expect_ok("lh0 compress", st);
+        memset(back, 0, sizeof(back));
+        st = lh_decompress(LH_METHOD_LH0, out, out_len, strlen(short_plain),
+            back, sizeof(back));
+        expect_ok("lh0 decompress", st);
+    }
 }
 
 static void test_archive_cycle(void)
