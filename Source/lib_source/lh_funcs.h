@@ -16,6 +16,10 @@
 
 #include "compiler.h"
 
+#ifndef LIBRARIES_LH_H
+#include <libraries/lh.h>
+#endif
+
 struct LhBuffer;
 struct LhArchive;
 
@@ -112,5 +116,9 @@ LONG __ASM__ __SAVE_DS__ LhPrintEntry(
     __REG__(a0, struct LhArchive *Archive),
     __REG__(a1, STRPTR Name));
 LONG __ASM__ __SAVE_DS__ LhErr(void);
+LONG __ASM__ __SAVE_DS__ LhGetSnapshot(
+    __REG__(a0, struct LhArchive *Archive),
+    __REG__(a1, STRPTR Name),
+    __REG__(a2, struct LhSnapshot *Out));
 
 #endif /* LH_FUNCS_H */

@@ -67,7 +67,7 @@ static void test_archive_cycle(void)
         return;
     }
     st = lh_writer_add(w, "hello.txt", NULL, LH_ATTR_DEFAULT, &dt,
-        LH_LEVEL_STORE, 1, data, sizeof(data) - 1);
+        LH_LEVEL_STORE, 1, data, sizeof(data) - 1, NULL);
     expect_ok("writer add", st);
     lh_writer_close(&w);
 
@@ -115,10 +115,10 @@ static void test_level1_multi_list(void)
         return;
     }
     st = lh_writer_add(w, "one.txt", NULL, LH_ATTR_DEFAULT, &dt,
-        LH_LEVEL_STORE, 1, a, sizeof(a) - 1);
+        LH_LEVEL_STORE, 1, a, sizeof(a) - 1, NULL);
     expect_ok("level1 writer add one", st);
     st = lh_writer_add(w, "two.txt", NULL, LH_ATTR_DEFAULT, &dt,
-        LH_LEVEL_STORE, 1, b, sizeof(b) - 1);
+        LH_LEVEL_STORE, 1, b, sizeof(b) - 1, NULL);
     expect_ok("level1 writer add two", st);
     lh_writer_close(&w);
 
@@ -173,12 +173,90 @@ static void test_buffer_api(void)
     lh_delete_buffer(buf);
 }
 
+static void test_snapshot_cycle(void)
+{
+    const char *arc = "smoke_cp.lzh";
+    lh_writer *w;
+    lh_reader *r;
+    lh_entry entry;
+    lh_datetime dt;
+    lh_status st;
+    lh_status err;
+    lh_snapshot cp;
+    const unsigned char data[] = "snapshot body";
+    unsigned char snap[LH_SNAP_ID_LEN];
+    unsigned char sha[LH_SNAP_SHA256_LEN];
+    int i;
+
+    memset(&cp, 0, sizeof(cp));
+    memset(snap, 0xAB, sizeof(snap));
+    memset(sha, 0xCD, sizeof(sha));
+    cp.generation = 3UL;
+    cp.size = (unsigned long)(sizeof(data) - 1);
+    cp.flags = 0;
+    cp.format = (unsigned char)LH_SNAP_FORMAT_V1;
+    memcpy(cp.snap_id, snap, LH_SNAP_ID_LEN);
+    memcpy(cp.sha256, sha, LH_SNAP_SHA256_LEN);
+    strcpy(cp.ver, "$VER: Smoke 1.0");
+
+    lh_datetime_from_time_t(&dt, 946684800L);
+    w = lh_writer_open(arc, 2, LH_LEVEL_STORE, &err);
+    if (!w) {
+        fprintf(stderr, "FAIL cp writer open: %s\n", lh_status_string(err));
+        fail_count++;
+        return;
+    }
+    st = lh_writer_add(w, "cp.txt", NULL, LH_ATTR_DEFAULT, &dt,
+        LH_LEVEL_STORE, 1, data, sizeof(data) - 1, &cp);
+    expect_ok("cp writer add", st);
+    lh_writer_close(&w);
+
+    r = lh_reader_open(arc, &err);
+    if (!r) {
+        fprintf(stderr, "FAIL cp reader open: %s\n", lh_status_string(err));
+        fail_count++;
+        remove(arc);
+        return;
+    }
+    memset(&entry, 0, sizeof(entry));
+    st = lh_reader_next(r, &entry);
+    expect_ok("cp reader next", st);
+    if (!entry.have_snapshot) {
+        fprintf(stderr, "FAIL cp missing on read\n");
+        fail_count++;
+    } else if (entry.snapshot.generation != 3UL
+        || entry.snapshot.size != (unsigned long)(sizeof(data) - 1)
+        || strcmp(entry.snapshot.ver, "$VER: Smoke 1.0") != 0) {
+        fprintf(stderr, "FAIL cp fields mismatch\n");
+        fail_count++;
+    } else {
+        for (i = 0; i < LH_SNAP_ID_LEN; i++) {
+            if (entry.snapshot.snap_id[i] != 0xAB) {
+                fprintf(stderr, "FAIL cp snap_id\n");
+                fail_count++;
+                break;
+            }
+        }
+        for (i = 0; i < LH_SNAP_SHA256_LEN; i++) {
+            if (entry.snapshot.sha256[i] != 0xCD) {
+                fprintf(stderr, "FAIL cp sha256\n");
+                fail_count++;
+                break;
+            }
+        }
+    }
+    lh_entry_clear(&entry);
+    lh_reader_close(&r);
+    remove(arc);
+}
+
 int main(void)
 {
     fail_count = 0;
     test_codec_roundtrip();
     test_archive_cycle();
     test_level1_multi_list();
+    test_snapshot_cycle();
     test_buffer_api();
     if (fail_count) {
         fprintf(stderr, "%d test(s) failed\n", fail_count);

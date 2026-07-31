@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "compiler.h"
+#include "/include/libraries/lh.h"
 #include "/include/lh.h"
 #include "lh/lhbase.h"
 #include "lh_archive_dos.h"
@@ -271,4 +272,12 @@ LONG __ASM__ __SAVE_DS__ LhErr(void)
         return LhBase->lhb_Err;
     }
     return 0;
+}
+
+LONG __ASM__ __SAVE_DS__ LhGetSnapshot(
+    __REG__(a0, struct LhArchive *Archive),
+    __REG__(a1, STRPTR Name),
+    __REG__(a2, struct LhSnapshot *Out))
+{
+    return lh_arc_get_snapshot(Archive, Name, Out);
 }

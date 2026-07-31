@@ -280,7 +280,7 @@ int lh_stream_open_write(lh_stream *s, const char *path)
     BPTR fh;
     LONG ioerr;
     int retry;
-    char aside[560];
+    char *aside;
     LONG plen;
 #endif
 
@@ -288,6 +288,7 @@ int lh_stream_open_write(lh_stream *s, const char *path)
         return 0;
     }
 #ifdef LH_AMIGA
+    /* aside must be heap — 560 bytes blows a typical Amiga stack frame. */
     for (retry = 0; retry < 4; retry++) {
         SetIoErr(0);
         fh = Open((STRPTR)path, MODE_OLDFILE);
@@ -307,23 +308,29 @@ int lh_stream_open_write(lh_stream *s, const char *path)
         }
     }
     plen = (LONG)strlen(path);
-    if (plen > 0 && plen < (LONG)sizeof(aside) - 4) {
-        strcpy(aside, path);
-        strcat(aside, ".$$");
+    if (plen <= 0 || plen >= 560 - 4) {
+        return 0;
+    }
+    aside = (char *)malloc(560);
+    if (!aside) {
+        return 0;
+    }
+    strcpy(aside, path);
+    strcat(aside, ".$$");
+    SetIoErr(0);
+    fh = Open((STRPTR)path, MODE_OLDFILE);
+    if (fh != (BPTR)NULL) {
+        Close(fh);
+    }
+    if (Rename((STRPTR)path, (STRPTR)aside)) {
+        DeleteFile((STRPTR)aside);
+    }
+    free(aside);
+    SetIoErr(0);
+    s->lh_fh = Open((STRPTR)path, MODE_NEWFILE);
+    if (s->lh_fh != (BPTR)NULL) {
         SetIoErr(0);
-        fh = Open((STRPTR)path, MODE_OLDFILE);
-        if (fh != (BPTR)NULL) {
-            Close(fh);
-        }
-        if (Rename((STRPTR)path, (STRPTR)aside)) {
-            DeleteFile((STRPTR)aside);
-        }
-        SetIoErr(0);
-        s->lh_fh = Open((STRPTR)path, MODE_NEWFILE);
-        if (s->lh_fh != (BPTR)NULL) {
-            SetIoErr(0);
-            return 1;
-        }
+        return 1;
     }
     return 0;
 #elif defined(LH_HOST)
@@ -500,6 +507,9 @@ static void lh_meta_to_entry(const lh_hdr_meta *meta, lh_entry *entry)
         if (entry->filename) {
             memcpy(entry->filename, meta->filename, flen + 1);
             lh_normalize_path_seps(entry->filename);
+            if (!meta->have_utf16_name) {
+                lh_oem_to_latin1_inplace(meta->os_id, entry->filename);
+            }
         }
     }
     if (meta->comment) {
@@ -507,6 +517,9 @@ static void lh_meta_to_entry(const lh_hdr_meta *meta, lh_entry *entry)
         entry->comment = (char *)malloc(clen + 1);
         if (entry->comment) {
             memcpy(entry->comment, meta->comment, clen + 1);
+            if (!meta->have_utf16_comment) {
+                lh_oem_to_latin1_inplace(meta->os_id, entry->comment);
+            }
         }
     }
     entry->attrs = meta->attribute;
@@ -522,6 +535,12 @@ static void lh_meta_to_entry(const lh_hdr_meta *meta, lh_entry *entry)
     entry->header_level = meta->header_level;
     entry->crc = meta->crc;
     entry->is_directory = meta->is_directory;
+    entry->have_snapshot = meta->have_snapshot;
+    if (meta->have_snapshot) {
+        memcpy(&entry->snapshot, &meta->snapshot, sizeof(entry->snapshot));
+    } else {
+        memset(&entry->snapshot, 0, sizeof(entry->snapshot));
+    }
 }
 
 void lh_entry_clear(lh_entry *entry)
@@ -608,11 +627,13 @@ lh_status lh_writer_add(
     lh_level level,
     int store_only,
     const unsigned char *data,
-    size_t data_len
+    size_t data_len,
+    const lh_snapshot *snapshot
 )
 {
-    lh_hdr_meta meta;
-    unsigned char *packed = NULL;
+    /* meta embeds lh_snapshot (~250B); never put this on the Amiga stack. */
+    lh_hdr_meta *meta;
+    unsigned char *packed;
     size_t packed_cap;
     size_t packed_len;
     lh_method method;
@@ -621,81 +642,142 @@ lh_status lh_writer_add(
     long rc;
     lh_datetime now;
 
+    packed = NULL;
     if (!w || !LH_STREAM_OPEN(&w->io) || !filename) {
         return LH_ERR_INVALID_ARG;
     }
-    memset(&meta, 0, sizeof(meta));
+    meta = (lh_hdr_meta *)calloc(1, sizeof(*meta));
+    if (!meta) {
+        return LH_ERR_NO_MEMORY;
+    }
     method = lh_level_to_method(level, store_only);
-    strncpy(meta.method_sig, lh_method_to_string(method), LH_SIG_LEN);
-    meta.method = method;
-    meta.original_size = (unsigned long)data_len;
-    meta.attribute = attrs;
-    meta.os_id = LH_OS_AMIGA;
-    meta.header_level = w->header_level;
-    meta.filename = (char *)filename;
+    strncpy(meta->method_sig, lh_method_to_string(method), LH_SIG_LEN);
+    meta->method = method;
+    meta->original_size = (unsigned long)data_len;
+    meta->attribute = attrs;
+    meta->os_id = LH_OS_AMIGA;
+    /* Ext 0x47 needs level-2 extension chain; promote this member if needed. */
+    meta->header_level = w->header_level;
+    if (snapshot && meta->header_level < 2) {
+        meta->header_level = 2;
+    }
+    meta->filename = (char *)filename;
     if (comment && comment[0]) {
-        meta.comment = (char *)comment;
+        meta->comment = (char *)comment;
+    }
+    if (snapshot) {
+        meta->have_snapshot = 1;
+        memcpy(&meta->snapshot, snapshot, sizeof(meta->snapshot));
+        if (meta->snapshot.format == 0) {
+            meta->snapshot.format = (unsigned char)LH_SNAP_FORMAT_V1;
+        }
     }
     if (datetime) {
-        if (w->header_level >= 2) {
-            meta.timestamp = lh_datetime_to_unix(datetime);
+        if (meta->header_level >= 2) {
+            meta->timestamp = lh_datetime_to_unix(datetime);
         } else {
             st = lh_datetime_pack(datetime, &ts);
             if (st != LH_OK) {
+                free(meta);
                 return st;
             }
-            meta.timestamp = ts;
+            meta->timestamp = ts;
         }
     } else {
         lh_datetime_now(&now);
-        if (w->header_level >= 2) {
-            meta.timestamp = lh_datetime_to_unix(&now);
+        if (meta->header_level >= 2) {
+            meta->timestamp = lh_datetime_to_unix(&now);
         } else {
-            meta.timestamp = lh_dos_timestamp_pack(&now);
+            meta->timestamp = lh_dos_timestamp_pack(&now);
         }
     }
     if (method == LH_METHOD_LHD) {
-        meta.packed_size = 0;
-        meta.is_directory = 1;
-        strncpy(meta.method_sig, LH_SIG_LHD, LH_SIG_LEN);
-        meta.method = LH_METHOD_LHD;
-        meta.crc = 0;
-        st = lh_hdr_write(&w->io, &meta, w->header_level);
+        meta->packed_size = 0;
+        meta->is_directory = 1;
+        strncpy(meta->method_sig, LH_SIG_LHD, LH_SIG_LEN);
+        meta->method = LH_METHOD_LHD;
+        meta->crc = 0;
+        st = lh_hdr_write(&w->io, meta, meta->header_level);
+        free(meta);
         return st;
     }
     if (data_len == 0) {
         /* Empty regular file: -lh0- (or chosen method) with zero payload. */
-        meta.packed_size = 0;
-        meta.crc = 0;
-        meta.has_crc = 1;
-        st = lh_hdr_write(&w->io, &meta, w->header_level);
+        meta->packed_size = 0;
+        meta->crc = 0;
+        meta->has_crc = 1;
+        st = lh_hdr_write(&w->io, meta, meta->header_level);
+        free(meta);
         return st;
     }
     packed_cap = data_len + data_len / 8 + 512;
     packed = (unsigned char *)malloc(packed_cap);
     if (!packed) {
+        free(meta);
         return LH_ERR_NO_MEMORY;
     }
     packed_len = packed_cap;
     rc = lh_codec_compress((void *)data, (unsigned long)data_len,
         packed, (unsigned long *)&packed_len, (long)method);
-    if (rc != 0) {
-        free(packed);
-        return LH_ERR_INVALID_ARG;
+    /*
+     * The simplified lh5 encoder can emit a stream the real decoder
+     * rejects.  Verify a round-trip before committing compressed bytes;
+     * otherwise fall through to -lh0- store (same as expand/fail).
+     */
+    if (rc == 0 && packed_len < data_len && method != LH_METHOD_LH0) {
+        unsigned char *verify;
+        long drc;
+
+        verify = (unsigned char *)malloc((size_t)data_len);
+        if (verify == NULL) {
+            rc = LH_ERR_NO_MEMORY;
+        } else {
+            drc = lh_codec_decompress(packed, (unsigned long)packed_len,
+                verify, (unsigned long)data_len, (long)method);
+            if (drc != 0
+                    || memcmp(verify, data, (size_t)data_len) != 0) {
+                rc = LH_ERR_CRC_MISMATCH;
+            }
+            free(verify);
+        }
     }
-    meta.packed_size = (unsigned long)packed_len;
-    meta.crc = lh_crc16(data, data_len);
-    meta.has_crc = 1;
-    st = lh_hdr_write(&w->io, &meta, w->header_level);
+    /*
+     * Classic LHA behaviour: if compress fails or does not shrink, store
+     * as -lh0-.  Also avoids LhErr 223 (WRITE_PROTECTED catch-all) when
+     * the simplified lh5 encoder expands or errors on Amiga.
+     */
+    if (rc != 0 || packed_len >= data_len) {
+        method = LH_METHOD_LH0;
+        strncpy(meta->method_sig, lh_method_to_string(method), LH_SIG_LEN);
+        meta->method = method;
+        if (packed_cap < data_len) {
+            free(packed);
+            packed = (unsigned char *)malloc(data_len);
+            if (!packed) {
+                free(meta);
+                return LH_ERR_NO_MEMORY;
+            }
+            packed_cap = data_len;
+        }
+        memcpy(packed, data, data_len);
+        packed_len = data_len;
+    }
+    meta->packed_size = (unsigned long)packed_len;
+    meta->crc = lh_crc16(data, data_len);
+    meta->has_crc = 1;
+    st = lh_hdr_write(&w->io, meta, meta->header_level);
     if (st != LH_OK) {
         free(packed);
+        free(meta);
         return st;
     }
     if (packed_len > 0 && lh_stream_write(&w->io, packed, packed_len) != packed_len) {
         free(packed);
+        free(meta);
         return LH_ERR_IO;
     }
     free(packed);
+    free(meta);
     return LH_OK;
 }
 
@@ -837,14 +919,18 @@ void lh_reader_set_header_only(lh_reader *r, int on)
 
 lh_status lh_reader_next(lh_reader *r, lh_entry *entry)
 {
-    lh_hdr_meta meta;
-    unsigned char *packed = NULL;
-    unsigned char *plain = NULL;
+    /* meta embeds lh_snapshot; allocate — Amiga stacks are tiny. */
+    lh_hdr_meta *meta;
+    unsigned char *packed;
+    unsigned char *plain;
     lh_status st;
     size_t n;
     unsigned short computed;
     long rc;
 
+    meta = NULL;
+    packed = NULL;
+    plain = NULL;
     if (!r || !entry) {
         return LH_ERR_INVALID_ARG;
     }
@@ -852,22 +938,28 @@ lh_status lh_reader_next(lh_reader *r, lh_entry *entry)
         entry->filename = NULL;
         return LH_OK;
     }
-    memset(&meta, 0, sizeof(meta));
-    st = lh_hdr_read(&r->io, &meta, 0);
+    meta = (lh_hdr_meta *)calloc(1, sizeof(*meta));
+    if (!meta) {
+        return LH_ERR_NO_MEMORY;
+    }
+    st = lh_hdr_read(&r->io, meta, 0);
     if (st == LH_ERR_TRUNCATED) {
         r->eof = 1;
         entry->filename = NULL;
+        free(meta);
         return LH_OK;
     }
     if (st != LH_OK) {
+        free(meta);
         return st;
     }
-    lh_meta_to_entry(&meta, entry);
+    lh_meta_to_entry(meta, entry);
     if (r->on_begin && entry->filename) {
         r->on_begin(r->progress_ctx, entry->filename, entry->data_len);
     }
-    if (meta.is_directory) {
-        lh_hdr_meta_clear(&meta);
+    if (meta->is_directory) {
+        lh_hdr_meta_clear(meta);
+        free(meta);
         return LH_OK;
     }
     /*
@@ -876,12 +968,14 @@ lh_status lh_reader_next(lh_reader *r, lh_entry *entry)
      * header.  packed_size==0 with original_size>0 is never valid LHA; treat
      * it as a header parse error instead of returning OK with no data buffer.
      */
-    if (meta.original_size == 0) {
-        lh_hdr_meta_clear(&meta);
+    if (meta->original_size == 0) {
+        lh_hdr_meta_clear(meta);
+        free(meta);
         return LH_OK;
     }
-    if (meta.packed_size == 0) {
-        lh_hdr_meta_clear(&meta);
+    if (meta->packed_size == 0) {
+        lh_hdr_meta_clear(meta);
+        free(meta);
         lh_entry_clear(entry);
         return LH_ERR_BAD_HEADER;
     }
@@ -891,75 +985,85 @@ lh_status lh_reader_next(lh_reader *r, lh_entry *entry)
          * cipher over those bytes so a later decompress stays in sync.
          */
         if (r->has_password) {
-            packed = (unsigned char *)malloc(meta.packed_size);
+            packed = (unsigned char *)malloc(meta->packed_size);
             if (!packed) {
-                lh_hdr_meta_clear(&meta);
+                lh_hdr_meta_clear(meta);
+                free(meta);
                 lh_entry_clear(entry);
                 return LH_ERR_NO_MEMORY;
             }
-            n = lh_stream_read(&r->io, packed, meta.packed_size);
-            if (n != meta.packed_size) {
+            n = lh_stream_read(&r->io, packed, meta->packed_size);
+            if (n != meta->packed_size) {
                 free(packed);
-                lh_hdr_meta_clear(&meta);
+                lh_hdr_meta_clear(meta);
+                free(meta);
                 lh_entry_clear(entry);
                 return LH_ERR_TRUNCATED;
             }
-            lh_decrypt_buffer(&r->decrypt, packed, meta.packed_size);
+            lh_decrypt_buffer(&r->decrypt, packed, meta->packed_size);
             free(packed);
             packed = NULL;
-        } else if (!lh_stream_seek_cur(&r->io, (long)meta.packed_size)) {
-            lh_hdr_meta_clear(&meta);
+        } else if (!lh_stream_seek_cur(&r->io, (long)meta->packed_size)) {
+            lh_hdr_meta_clear(meta);
+            free(meta);
             lh_entry_clear(entry);
             return LH_ERR_IO;
         }
         entry->crc_ok = 1;
-        lh_hdr_meta_clear(&meta);
+        lh_hdr_meta_clear(meta);
+        free(meta);
         return LH_OK;
     }
-    packed = (unsigned char *)malloc(meta.packed_size);
+    packed = (unsigned char *)malloc(meta->packed_size);
     if (!packed) {
-        lh_hdr_meta_clear(&meta);
+        lh_hdr_meta_clear(meta);
+        free(meta);
         lh_entry_clear(entry);
         return LH_ERR_NO_MEMORY;
     }
-    n = lh_stream_read(&r->io, packed, meta.packed_size);
-    if (n != meta.packed_size) {
+    n = lh_stream_read(&r->io, packed, meta->packed_size);
+    if (n != meta->packed_size) {
         free(packed);
-        lh_hdr_meta_clear(&meta);
+        lh_hdr_meta_clear(meta);
+        free(meta);
         lh_entry_clear(entry);
         return LH_ERR_TRUNCATED;
     }
     if (r->has_password) {
-        lh_decrypt_buffer(&r->decrypt, packed, meta.packed_size);
+        lh_decrypt_buffer(&r->decrypt, packed, meta->packed_size);
     }
-    plain = (unsigned char *)malloc(meta.original_size ? meta.original_size : 1);
+    plain = (unsigned char *)malloc(meta->original_size ? meta->original_size : 1);
     if (!plain) {
         free(packed);
-        lh_hdr_meta_clear(&meta);
+        lh_hdr_meta_clear(meta);
+        free(meta);
         lh_entry_clear(entry);
         return LH_ERR_NO_MEMORY;
     }
-    rc = lh_codec_decompress(packed, meta.packed_size, plain,
-        meta.original_size, (long)meta.method);
+    rc = lh_codec_decompress(packed, meta->packed_size, plain,
+        meta->original_size, (long)meta->method);
     free(packed);
+    packed = NULL;
     if (rc != 0) {
         free(plain);
-        lh_hdr_meta_clear(&meta);
+        lh_hdr_meta_clear(meta);
+        free(meta);
         lh_entry_clear(entry);
         return LH_ERR_INVALID_ARCHIVE;
     }
-    computed = lh_crc16(plain, meta.original_size);
+    computed = lh_crc16(plain, meta->original_size);
     entry->data = plain;
-    entry->data_len = meta.original_size;
-    entry->crc_ok = (meta.has_crc == 0 || computed == meta.crc);
+    entry->data_len = meta->original_size;
+    entry->crc_ok = (meta->has_crc == 0 || computed == meta->crc);
     if (r->on_progress) {
-        r->on_progress(r->progress_ctx, meta.original_size, meta.original_size);
+        r->on_progress(r->progress_ctx, meta->original_size, meta->original_size);
     }
     if (r->on_end && entry->filename) {
         r->on_end(r->progress_ctx, entry->filename, entry->crc_ok,
-            meta.crc, computed, meta.original_size);
+            meta->crc, computed, meta->original_size);
     }
-    lh_hdr_meta_clear(&meta);
+    lh_hdr_meta_clear(meta);
+    free(meta);
     return LH_OK;
 }
 
@@ -1026,49 +1130,72 @@ lh_status lh_archive_rewrite(
     int store_only
 )
 {
-    char temp[512];
+    char *temp;
     lh_reader *r;
     lh_writer *w;
-    lh_entry entry;
+    lh_entry *entry;
     lh_status st;
     lh_status err;
+    size_t alen;
+
+    temp = NULL;
+    entry = NULL;
+    r = NULL;
+    w = NULL;
+    st = LH_OK;
 
     if (!archive || !keep) {
         return LH_ERR_INVALID_ARG;
     }
-    strncpy(temp, archive, sizeof(temp) - 6);
-    temp[sizeof(temp) - 6] = '\0';
+    alen = strlen(archive);
+    if (alen + 5 >= 512) {
+        return LH_ERR_INVALID_ARG;
+    }
+    temp = (char *)malloc(512);
+    entry = (lh_entry *)calloc(1, sizeof(*entry));
+    if (!temp || !entry) {
+        free(temp);
+        free(entry);
+        return LH_ERR_NO_MEMORY;
+    }
+    strncpy(temp, archive, 512 - 6);
+    temp[512 - 6] = '\0';
     strcat(temp, ".$$$");
 
     r = lh_reader_open(archive, &err);
     if (!r) {
+        free(temp);
+        free(entry);
         return err;
     }
     w = lh_writer_open(temp, header_level, level, &err);
     if (!w) {
         lh_reader_close(&r);
+        free(temp);
+        free(entry);
         return err;
     }
     for (;;) {
-        memset(&entry, 0, sizeof(entry));
-        st = lh_reader_next(r, &entry);
-        if (st == LH_OK && !entry.filename) {
+        memset(entry, 0, sizeof(*entry));
+        st = lh_reader_next(r, entry);
+        if (st == LH_OK && !entry->filename) {
             break;
         }
         if (st != LH_OK) {
-            lh_entry_clear(&entry);
+            lh_entry_clear(entry);
             break;
         }
-        if (keep(&entry, ctx)) {
-            st = lh_writer_add(w, entry.filename, entry.comment, entry.attrs,
-                &entry.datetime, level, store_only,
-                entry.data, entry.data_len);
-            lh_entry_clear(&entry);
+        if (keep(entry, ctx)) {
+            st = lh_writer_add(w, entry->filename, entry->comment, entry->attrs,
+                &entry->datetime, level, store_only,
+                entry->data, entry->data_len,
+                entry->have_snapshot ? &entry->snapshot : NULL);
+            lh_entry_clear(entry);
             if (st != LH_OK) {
                 break;
             }
         } else {
-            lh_entry_clear(&entry);
+            lh_entry_clear(entry);
         }
     }
     lh_reader_close(&r);
@@ -1079,18 +1206,26 @@ lh_status lh_archive_rewrite(
 #elif defined(LH_HOST)
         remove(temp);
 #endif
+        free(temp);
+        free(entry);
         return st;
     }
 #ifdef LH_AMIGA
     DeleteFile((STRPTR)archive);
     if (Rename((STRPTR)temp, (STRPTR)archive) == DOSFALSE) {
+        free(temp);
+        free(entry);
         return LH_ERR_IO;
     }
 #elif defined(LH_HOST)
     remove(archive);
     if (rename(temp, archive) != 0) {
+        free(temp);
+        free(entry);
         return LH_ERR_IO;
     }
 #endif
+    free(temp);
+    free(entry);
     return LH_OK;
 }

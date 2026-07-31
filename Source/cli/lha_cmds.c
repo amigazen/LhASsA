@@ -492,7 +492,7 @@ static int lha_cmd_add(const lha_args *args)
         arcname = lha_basename(args->files[i]);
         lha_add_message(arcname);
         st = lh_writer_add(w, arcname, NULL, LH_ATTR_DEFAULT, &dt,
-            g_opts.level, g_opts.store_only, data, len);
+            g_opts.level, g_opts.store_only, data, len, NULL);
         free(arcname);
         free(data);
         if (st != LH_OK) {
@@ -575,7 +575,8 @@ static int lha_cmd_concat(const lha_args *args)
             }
             st = lh_writer_add(w, entry.filename, entry.comment, entry.attrs,
                 &entry.datetime, g_opts.level, g_opts.store_only,
-                entry.data, entry.data_len);
+                entry.data, entry.data_len,
+                entry.have_snapshot ? &entry.snapshot : NULL);
             lh_entry_clear(&entry);
             if (st != LH_OK) {
                 break;

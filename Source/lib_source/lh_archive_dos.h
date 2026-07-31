@@ -25,6 +25,7 @@
 #define LHADD_DateStamp  (TAG_USER + 3)
 #define LHADD_Comment    (TAG_USER + 4)
 #define LHADD_Directory  (TAG_USER + 5)
+#define LHADD_Snapshot (TAG_USER + 6)
 #endif
 
 struct LhArchive;
@@ -50,6 +51,8 @@ LONG lh_arc_read_data(struct LhArchive *archive, STRPTR name, APTR *data_out);
 LONG lh_arc_extract_entry(struct LhArchive *archive, STRPTR name, STRPTR dest);
 LONG lh_arc_test_entry(struct LhArchive *archive, STRPTR name);
 LONG lh_arc_print_entry(struct LhArchive *archive, STRPTR name);
+LONG lh_arc_get_snapshot(struct LhArchive *archive, STRPTR name,
+    struct LhSnapshot *out);
 LONG lh_arc_read(BPTR fh, APTR buffer, LONG len);
 LONG lh_arc_write(BPTR fh, APTR buffer, LONG len);
 LONG lh_arc_closefh(BPTR fh);

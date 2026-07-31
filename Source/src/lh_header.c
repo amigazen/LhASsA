@@ -51,11 +51,12 @@ void lh_normalize_path_seps(char *path)
 
 lh_u32 lh_read_le32(const unsigned char *p)
 {
+    /* Use lh_u32 shifts so 16-bit int builds cannot truncate high bytes. */
     return (lh_u32)(
-        ((unsigned int)p[0])
-      | ((unsigned int)p[1] << 8)
-      | ((unsigned int)p[2] << 16)
-      | ((unsigned int)p[3] << 24)
+        ((lh_u32)p[0])
+      | ((lh_u32)p[1] << 8)
+      | ((lh_u32)p[2] << 16)
+      | ((lh_u32)p[3] << 24)
     );
 }
 
@@ -86,6 +87,113 @@ void lh_hdr_meta_clear(lh_hdr_meta *m)
     free(m->filename);
     free(m->comment);
     memset(m, 0, sizeof(*m));
+}
+
+#define LH_SNAP_MAGIC0 'L'
+#define LH_SNAP_MAGIC1 'H'
+#define LH_SNAP_MAGIC2 'S'
+#define LH_SNAP_MAGIC3 'S'
+#define LH_SNAP_BASE_LEN 64u
+
+lh_status lh_snapshot_pack(
+    const lh_snapshot *cp,
+    unsigned char **out_bytes,
+    size_t *out_len)
+{
+    size_t ver_len;
+    size_t total;
+    unsigned char *buf;
+
+    if (!cp || !out_bytes || !out_len) {
+        return LH_ERR_INVALID_ARG;
+    }
+    *out_bytes = NULL;
+    *out_len = 0;
+
+    ver_len = strlen(cp->ver);
+    if (ver_len > LH_SNAP_VER_MAX) {
+        ver_len = LH_SNAP_VER_MAX;
+    }
+    total = LH_SNAP_BASE_LEN + 1u + ver_len;
+    buf = (unsigned char *)malloc(total);
+    if (!buf) {
+        return LH_ERR_NO_MEMORY;
+    }
+    buf[0] = (unsigned char)LH_SNAP_MAGIC0;
+    buf[1] = (unsigned char)LH_SNAP_MAGIC1;
+    buf[2] = (unsigned char)LH_SNAP_MAGIC2;
+    buf[3] = (unsigned char)LH_SNAP_MAGIC3;
+    buf[4] = cp->format ? cp->format : (unsigned char)LH_SNAP_FORMAT_V1;
+    buf[5] = cp->flags;
+    buf[6] = 0;
+    buf[7] = 0;
+    lh_write_le32(buf + 8, (lh_u32)cp->generation);
+    lh_write_le32(buf + 12, (lh_u32)cp->size);
+    memcpy(buf + 16, cp->snap_id, LH_SNAP_ID_LEN);
+    memcpy(buf + 32, cp->sha256, LH_SNAP_SHA256_LEN);
+    buf[64] = (unsigned char)ver_len;
+    if (ver_len > 0) {
+        memcpy(buf + 65, cp->ver, ver_len);
+    }
+    *out_bytes = buf;
+    *out_len = total;
+    return LH_OK;
+}
+
+lh_status lh_snapshot_unpack(
+    const unsigned char *src,
+    size_t src_len,
+    lh_snapshot *cp)
+{
+    unsigned char ver_len;
+
+    if (!src || !cp) {
+        return LH_ERR_INVALID_ARG;
+    }
+    memset(cp, 0, sizeof(*cp));
+    if (src_len < LH_SNAP_BASE_LEN + 1u) {
+        return LH_ERR_BAD_HEADER;
+    }
+    if (src[0] != (unsigned char)LH_SNAP_MAGIC0
+        || src[1] != (unsigned char)LH_SNAP_MAGIC1
+        || src[2] != (unsigned char)LH_SNAP_MAGIC2
+        || src[3] != (unsigned char)LH_SNAP_MAGIC3) {
+        return LH_ERR_BAD_HEADER;
+    }
+    cp->format = src[4];
+    if (cp->format != (unsigned char)LH_SNAP_FORMAT_V1) {
+        return LH_ERR_UNSUPPORTED;
+    }
+    cp->flags = src[5];
+    cp->generation = lh_read_le32(src + 8);
+    cp->size = lh_read_le32(src + 12);
+    memcpy(cp->snap_id, src + 16, LH_SNAP_ID_LEN);
+    memcpy(cp->sha256, src + 32, LH_SNAP_SHA256_LEN);
+    ver_len = src[64];
+    if ((size_t)ver_len > LH_SNAP_VER_MAX
+        || LH_SNAP_BASE_LEN + 1u + (size_t)ver_len > src_len) {
+        return LH_ERR_BAD_HEADER;
+    }
+    if (ver_len > 0) {
+        memcpy(cp->ver, src + 65, ver_len);
+    }
+    cp->ver[ver_len] = '\0';
+    return LH_OK;
+}
+
+static lh_status lh_ext_set_snapshot(
+    lh_hdr_meta *meta,
+    const unsigned char *payload,
+    size_t payload_len)
+{
+    lh_status st;
+
+    st = lh_snapshot_unpack(payload, payload_len, &meta->snapshot);
+    if (st != LH_OK) {
+        return st;
+    }
+    meta->have_snapshot = 1;
+    return LH_OK;
 }
 
 static unsigned char lh_hdr_checksum(const unsigned char *data, size_t len)
@@ -170,20 +278,28 @@ static void lh_hdr_read_base_from_buf(lh_hdr_meta *meta, unsigned char *buf)
 
 static lh_status lh_hdr_skip_bytes(lh_stream *io, size_t n)
 {
-    unsigned char scratch[256];
+    unsigned char *scratch;
     size_t chunk;
+    lh_status st;
 
+    scratch = (unsigned char *)malloc(256);
+    if (!scratch) {
+        return LH_ERR_NO_MEMORY;
+    }
+    st = LH_OK;
     while (n > 0) {
         chunk = n;
-        if (chunk > sizeof(scratch)) {
-            chunk = sizeof(scratch);
+        if (chunk > 256u) {
+            chunk = 256u;
         }
         if (lh_stream_read(io, scratch, chunk) != chunk) {
-            return LH_ERR_TRUNCATED;
+            st = LH_ERR_TRUNCATED;
+            break;
         }
         n -= chunk;
     }
-    return LH_OK;
+    free(scratch);
+    return st;
 }
 
 static int lh_mf_read(
@@ -225,88 +341,15 @@ static int lh_mf_read(
     return 1;
 }
 
-/* Level-2 extensions live entirely in the header buffer (lha-114i: no fread). */
-static lh_status lh_hdr_read_extensions_buf(
+/* Promote dirname + basename into meta->filename (shared by ext readers). */
+static lh_status lh_ext_combine_dir_file(
     lh_hdr_meta *meta,
-    const unsigned char *mem,
-    size_t mem_len,
-    unsigned long *ext_total)
+    char *dirbuf,
+    size_t dir_len)
 {
-    size_t pos;
-    unsigned short blk_len;
-    unsigned char blk_type;
-    size_t payload;
-    char dirbuf[512];
-    size_t dir_len;
     char *combined;
     size_t dlen;
     size_t flen;
-    unsigned long consumed;
-
-    dirbuf[0] = '\0';
-    dir_len = 0;
-    pos = 0;
-    consumed = 0;
-    if (ext_total) {
-        *ext_total = 0;
-    }
-
-    while (pos + 2u <= mem_len) {
-        blk_len = lh_read_le16(mem + pos);
-        pos += 2;
-        consumed += 2;
-        if (blk_len == 0) {
-            break;
-        }
-        if (blk_len < 3 || pos + (size_t)blk_len - 3u > mem_len) {
-            return LH_ERR_BAD_HEADER;
-        }
-        blk_type = mem[pos++];
-        consumed += 1;
-        payload = (size_t)blk_len - 3u;
-
-        if (blk_type == 1) {
-            free(meta->filename);
-            meta->filename = NULL;
-            if (payload > 0) {
-                meta->filename = (char *)malloc(payload + 1u);
-                if (!meta->filename) {
-                    return LH_ERR_NO_MEMORY;
-                }
-                memcpy(meta->filename, mem + pos, payload);
-                meta->filename[payload] = '\0';
-            }
-        } else if (blk_type == 2) {
-            if (payload > 0 && payload < sizeof(dirbuf)) {
-                memcpy(dirbuf, mem + pos, payload);
-                dirbuf[payload] = '\0';
-                dir_len = payload;
-                /* LHA type-2 uses 0xFF as path separator. */
-                {
-                    size_t di;
-
-                    for (di = 0; di < dir_len; di++) {
-                        if (dirbuf[di] == LH_PATH_SEP) {
-                            dirbuf[di] = '/';
-                        }
-                    }
-                }
-            }
-        } else if (blk_type == LH_EXT_COMMENT) {
-            free(meta->comment);
-            meta->comment = NULL;
-            if (payload > 0) {
-                meta->comment = (char *)malloc(payload + 1u);
-                if (!meta->comment) {
-                    return LH_ERR_NO_MEMORY;
-                }
-                memcpy(meta->comment, mem + pos, payload);
-                meta->comment[payload] = '\0';
-            }
-        }
-        pos += payload;
-        consumed += payload;
-    }
 
     if (dir_len > 0 && meta->filename && meta->filename[0]) {
         dlen = dir_len;
@@ -326,8 +369,8 @@ static lh_status lh_hdr_read_extensions_buf(
     } else if (dir_len > 0
         && (meta->filename == NULL || meta->filename[0] == '\0')) {
         /*
-         * Level-2 -lhd- names often live only in type-0x02 (dir) with an
-         * empty type-0x01 filename block.  Promote the directory path.
+         * Level-2 -lhd- names often live only in type-0x02 / 0x45 with an
+         * empty filename block.  Promote the directory path.
          */
         free(meta->filename);
         meta->filename = NULL;
@@ -345,11 +388,221 @@ static lh_status lh_hdr_read_extensions_buf(
         memcpy(meta->filename, dirbuf, dlen);
         meta->filename[dlen] = '\0';
     }
+    return LH_OK;
+}
 
+static void lh_dir_normalize_ff(char *dirbuf, size_t dir_len)
+{
+    size_t di;
+
+    for (di = 0; di < dir_len; di++) {
+        if (dirbuf[di] == LH_PATH_SEP) {
+            dirbuf[di] = '/';
+        }
+    }
+}
+
+static lh_status lh_ext_set_legacy_name(
+    lh_hdr_meta *meta,
+    const unsigned char *payload,
+    size_t payload_len)
+{
+    if (meta->have_utf16_name) {
+        return LH_OK;
+    }
+    free(meta->filename);
+    meta->filename = NULL;
+    if (payload_len == 0) {
+        return LH_OK;
+    }
+    meta->filename = (char *)malloc(payload_len + 1u);
+    if (!meta->filename) {
+        return LH_ERR_NO_MEMORY;
+    }
+    memcpy(meta->filename, payload, payload_len);
+    meta->filename[payload_len] = '\0';
+    return LH_OK;
+}
+
+static lh_status lh_ext_set_utf16_name(
+    lh_hdr_meta *meta,
+    const unsigned char *payload,
+    size_t payload_len)
+{
+    char *s;
+    lh_status st;
+
+    st = lh_utf16le_to_latin1(payload, payload_len, &s);
+    if (st != LH_OK) {
+        return st;
+    }
+    free(meta->filename);
+    meta->filename = s;
+    meta->have_utf16_name = 1;
+    return LH_OK;
+}
+
+static lh_status lh_ext_set_legacy_comment(
+    lh_hdr_meta *meta,
+    const unsigned char *payload,
+    size_t payload_len)
+{
+    if (meta->have_utf16_comment) {
+        return LH_OK;
+    }
+    free(meta->comment);
+    meta->comment = NULL;
+    if (payload_len == 0) {
+        return LH_OK;
+    }
+    meta->comment = (char *)malloc(payload_len + 1u);
+    if (!meta->comment) {
+        return LH_ERR_NO_MEMORY;
+    }
+    memcpy(meta->comment, payload, payload_len);
+    meta->comment[payload_len] = '\0';
+    return LH_OK;
+}
+
+static lh_status lh_ext_set_utf16_comment(
+    lh_hdr_meta *meta,
+    const unsigned char *payload,
+    size_t payload_len)
+{
+    char *s;
+    lh_status st;
+
+    st = lh_utf16le_to_latin1(payload, payload_len, &s);
+    if (st != LH_OK) {
+        return st;
+    }
+    free(meta->comment);
+    meta->comment = s;
+    meta->have_utf16_comment = 1;
+    return LH_OK;
+}
+
+static lh_status lh_ext_set_legacy_dir(
+    char *dirbuf,
+    size_t dirbuf_size,
+    size_t *dir_len,
+    int have_utf16_dir,
+    const unsigned char *payload,
+    size_t payload_len)
+{
+    if (have_utf16_dir) {
+        return LH_OK;
+    }
+    if (payload_len == 0 || payload_len >= dirbuf_size) {
+        return LH_OK;
+    }
+    memcpy(dirbuf, payload, payload_len);
+    dirbuf[payload_len] = '\0';
+    *dir_len = payload_len;
+    lh_dir_normalize_ff(dirbuf, *dir_len);
+    return LH_OK;
+}
+
+static lh_status lh_ext_set_utf16_dir(
+    lh_hdr_meta *meta,
+    char *dirbuf,
+    size_t dirbuf_size,
+    size_t *dir_len,
+    const unsigned char *payload,
+    size_t payload_len)
+{
+    size_t got;
+    lh_status st;
+
+    st = lh_utf16le_to_latin1_buf(payload, payload_len, dirbuf, dirbuf_size, &got);
+    if (st != LH_OK) {
+        return st;
+    }
+    *dir_len = got;
+    meta->have_utf16_dir = 1;
+    return LH_OK;
+}
+
+/* Level-2 extensions live entirely in the header buffer (lha-114i: no fread). */
+static lh_status lh_hdr_read_extensions_buf(
+    lh_hdr_meta *meta,
+    const unsigned char *mem,
+    size_t mem_len,
+    unsigned long *ext_total)
+{
+    size_t pos;
+    unsigned short blk_len;
+    unsigned char blk_type;
+    size_t payload;
+    char *dirbuf;
+    size_t dir_len;
+    unsigned long consumed;
+    lh_status st;
+
+    dirbuf = (char *)malloc(512);
+    if (!dirbuf) {
+        return LH_ERR_NO_MEMORY;
+    }
+    dirbuf[0] = '\0';
+    dir_len = 0;
+    pos = 0;
+    consumed = 0;
+    st = LH_OK;
     if (ext_total) {
+        *ext_total = 0;
+    }
+
+    while (pos + 2u <= mem_len) {
+        blk_len = lh_read_le16(mem + pos);
+        pos += 2;
+        consumed += 2;
+        if (blk_len == 0) {
+            break;
+        }
+        /* pos is at type; need blk_len-2 more bytes (type + payload). */
+        if (blk_len < 3 || pos + (size_t)blk_len - 2u > mem_len) {
+            st = LH_ERR_BAD_HEADER;
+            break;
+        }
+        blk_type = mem[pos++];
+        consumed += 1;
+        payload = (size_t)blk_len - 3u;
+
+        if (blk_type == LH_EXT_FILENAME) {
+            st = lh_ext_set_legacy_name(meta, mem + pos, payload);
+        } else if (blk_type == LH_EXT_PATH) {
+            st = lh_ext_set_legacy_dir(dirbuf, 512, &dir_len,
+                meta->have_utf16_dir, mem + pos, payload);
+        } else if (blk_type == LH_EXT_COMMENT) {
+            st = lh_ext_set_legacy_comment(meta, mem + pos, payload);
+        } else if (blk_type == LH_EXT_UTF16_FILENAME) {
+            st = lh_ext_set_utf16_name(meta, mem + pos, payload);
+        } else if (blk_type == LH_EXT_UTF16_PATH) {
+            st = lh_ext_set_utf16_dir(meta, dirbuf, 512, &dir_len,
+                mem + pos, payload);
+        } else if (blk_type == LH_EXT_UTF16_COMMENT) {
+            st = lh_ext_set_utf16_comment(meta, mem + pos, payload);
+        } else if (blk_type == LH_EXT_SNAPSHOT) {
+            st = lh_ext_set_snapshot(meta, mem + pos, payload);
+        } else {
+            st = LH_OK;
+        }
+        if (st != LH_OK) {
+            break;
+        }
+        /* 0x41 Windows FILETIME and other types: skip payload. */
+        pos += payload;
+        consumed += payload;
+    }
+
+    if (st == LH_OK) {
+        st = lh_ext_combine_dir_file(meta, dirbuf, dir_len);
+    }
+    if (st == LH_OK && ext_total) {
         *ext_total = consumed;
     }
-    return LH_OK;
+    free(dirbuf);
+    return st;
 }
 
 static int lh_mf_skip(
@@ -359,20 +612,28 @@ static int lh_mf_skip(
     size_t *mem_pos,
     size_t n)
 {
-    unsigned char scratch[256];
+    unsigned char *scratch;
     size_t chunk;
+    int ok;
 
+    scratch = (unsigned char *)malloc(256);
+    if (!scratch) {
+        return 0;
+    }
+    ok = 1;
     while (n > 0) {
         chunk = n;
-        if (chunk > sizeof(scratch)) {
-            chunk = sizeof(scratch);
+        if (chunk > 256u) {
+            chunk = 256u;
         }
         if (!lh_mf_read(io, mem, mem_len, mem_pos, scratch, chunk)) {
-            return 0;
+            ok = 0;
+            break;
         }
         n -= chunk;
     }
-    return 1;
+    free(scratch);
+    return ok;
 }
 
 static lh_status lh_hdr_read_extensions(
@@ -386,152 +647,122 @@ static lh_status lh_hdr_read_extensions(
     unsigned char blk_type;
     size_t payload;
     size_t mem_pos;
-    char dirbuf[512];
+    char *dirbuf;
     size_t dir_len;
-    char *combined;
-    size_t dlen;
-    size_t flen;
     unsigned long consumed;
     lh_status st;
+    unsigned char *tmp;
+    size_t left;
+    size_t chunk;
+    unsigned char *scratch;
 
+    dirbuf = (char *)malloc(512);
+    scratch = (unsigned char *)malloc(256);
+    if (!dirbuf || !scratch) {
+        free(dirbuf);
+        free(scratch);
+        return LH_ERR_NO_MEMORY;
+    }
     dirbuf[0] = '\0';
     dir_len = 0;
     consumed = 0;
     mem_pos = 0;
+    st = LH_OK;
     if (ext_total) {
         *ext_total = 0;
     }
 
     for (;;) {
         if (!lh_mf_read(io, mem, mem_len, &mem_pos, &blk_len, 2)) {
-            return LH_ERR_TRUNCATED;
+            st = LH_ERR_TRUNCATED;
+            break;
         }
         consumed += 2;
         if (blk_len == 0) {
             break;
         }
         if (blk_len < 3) {
-            return LH_ERR_BAD_HEADER;
+            st = LH_ERR_BAD_HEADER;
+            break;
         }
         payload = (size_t)blk_len - 3u;
         if (!lh_mf_read(io, mem, mem_len, &mem_pos, &blk_type, 1)) {
-            return LH_ERR_TRUNCATED;
+            st = LH_ERR_TRUNCATED;
+            break;
         }
         consumed += 1;
 
-        if (blk_type == 1) {
-            free(meta->filename);
-            meta->filename = NULL;
+        if (blk_type == LH_EXT_FILENAME
+            || blk_type == LH_EXT_COMMENT
+            || blk_type == LH_EXT_UTF16_FILENAME
+            || blk_type == LH_EXT_UTF16_COMMENT
+            || blk_type == LH_EXT_PATH
+            || blk_type == LH_EXT_UTF16_PATH
+            || blk_type == LH_EXT_SNAPSHOT) {
+            tmp = NULL;
             if (payload > 0) {
-                meta->filename = (char *)malloc(payload + 1u);
-                if (!meta->filename) {
-                    return LH_ERR_NO_MEMORY;
+                tmp = (unsigned char *)malloc(payload);
+                if (!tmp) {
+                    st = LH_ERR_NO_MEMORY;
+                    break;
                 }
-                if (!lh_mf_read(io, mem, mem_len, &mem_pos, meta->filename, payload)) {
-                    free(meta->filename);
-                    meta->filename = NULL;
-                    return LH_ERR_TRUNCATED;
-                }
-                meta->filename[payload] = '\0';
-            }
-        } else if (blk_type == 2) {
-            if (payload >= sizeof(dirbuf)) {
-                if (!lh_mf_skip(io, mem, mem_len, &mem_pos, payload)) {
-                    return LH_ERR_TRUNCATED;
-                }
-            } else if (payload > 0) {
-                if (!lh_mf_read(io, mem, mem_len, &mem_pos, dirbuf, payload)) {
-                    return LH_ERR_TRUNCATED;
-                }
-                dirbuf[payload] = '\0';
-                dir_len = payload;
-                {
-                    size_t di;
-
-                    for (di = 0; di < dir_len; di++) {
-                        if (dirbuf[di] == LH_PATH_SEP) {
-                            dirbuf[di] = '/';
-                        }
-                    }
+                if (!lh_mf_read(io, mem, mem_len, &mem_pos, tmp, payload)) {
+                    free(tmp);
+                    st = LH_ERR_TRUNCATED;
+                    break;
                 }
             }
-        } else if (blk_type == LH_EXT_COMMENT) {
-            free(meta->comment);
-            meta->comment = NULL;
-            if (payload > 0) {
-                meta->comment = (char *)malloc(payload + 1u);
-                if (!meta->comment) {
-                    return LH_ERR_NO_MEMORY;
-                }
-                if (!lh_mf_read(io, mem, mem_len, &mem_pos, meta->comment, payload)) {
-                    free(meta->comment);
-                    meta->comment = NULL;
-                    return LH_ERR_TRUNCATED;
-                }
-                meta->comment[payload] = '\0';
+            if (blk_type == LH_EXT_FILENAME) {
+                st = lh_ext_set_legacy_name(meta, tmp, payload);
+            } else if (blk_type == LH_EXT_PATH) {
+                st = lh_ext_set_legacy_dir(dirbuf, 512, &dir_len,
+                    meta->have_utf16_dir, tmp, payload);
+            } else if (blk_type == LH_EXT_COMMENT) {
+                st = lh_ext_set_legacy_comment(meta, tmp, payload);
+            } else if (blk_type == LH_EXT_UTF16_FILENAME) {
+                st = lh_ext_set_utf16_name(meta, tmp, payload);
+            } else if (blk_type == LH_EXT_UTF16_PATH) {
+                st = lh_ext_set_utf16_dir(meta, dirbuf, 512,
+                    &dir_len, tmp, payload);
+            } else if (blk_type == LH_EXT_UTF16_COMMENT) {
+                st = lh_ext_set_utf16_comment(meta, tmp, payload);
+            } else {
+                st = lh_ext_set_snapshot(meta, tmp, payload);
+            }
+            free(tmp);
+            if (st != LH_OK) {
+                break;
             }
         } else if (payload > 0) {
-            unsigned char scratch[256];
-            size_t left;
-            size_t chunk;
-
+            /* FILETIME 0x41 and unknown: skip. */
             left = payload;
             while (left > 0) {
                 chunk = left;
-                if (chunk > sizeof(scratch)) {
-                    chunk = sizeof(scratch);
+                if (chunk > 256u) {
+                    chunk = 256u;
                 }
                 if (!lh_mf_read(io, mem, mem_len, &mem_pos, scratch, chunk)) {
-                    return LH_ERR_TRUNCATED;
+                    st = LH_ERR_TRUNCATED;
+                    break;
                 }
                 left -= chunk;
+            }
+            if (st != LH_OK) {
+                break;
             }
         }
         consumed += payload;
     }
 
-    if (dir_len > 0 && meta->filename && meta->filename[0]) {
-        dlen = dir_len;
-        flen = strlen(meta->filename);
-        combined = (char *)malloc(dlen + flen + 2u);
-        if (!combined) {
-            return LH_ERR_NO_MEMORY;
-        }
-        memcpy(combined, dirbuf, dlen);
-        if (dlen > 0 && dirbuf[dlen - 1] != '/' && dirbuf[dlen - 1] != ':') {
-            combined[dlen] = '/';
-            dlen++;
-        }
-        memcpy(combined + dlen, meta->filename, flen + 1u);
-        free(meta->filename);
-        meta->filename = combined;
-    } else if (dir_len > 0
-        && (meta->filename == NULL || meta->filename[0] == '\0')) {
-        /*
-         * Level-2 -lhd- (and some leaves) carry the name only in the
-         * type-0x02 directory extension; type-0x01 may be empty.
-         */
-        free(meta->filename);
-        meta->filename = NULL;
-        dlen = dir_len;
-        while (dlen > 0 && (dirbuf[dlen - 1] == '/' || dirbuf[dlen - 1] == ':')) {
-            dlen--;
-        }
-        if (dlen == 0) {
-            return LH_ERR_BAD_HEADER;
-        }
-        meta->filename = (char *)malloc(dlen + 1u);
-        if (!meta->filename) {
-            return LH_ERR_NO_MEMORY;
-        }
-        memcpy(meta->filename, dirbuf, dlen);
-        meta->filename[dlen] = '\0';
+    if (st == LH_OK) {
+        st = lh_ext_combine_dir_file(meta, dirbuf, dir_len);
     }
-
-    if (ext_total) {
+    if (st == LH_OK && ext_total) {
         *ext_total = consumed;
     }
-    return LH_OK;
+    free(dirbuf);
+    free(scratch);
+    return st;
 }
 
 static lh_status lh_hdr_read_level2(lh_stream *io, lh_hdr_meta *meta, unsigned char *buf)
@@ -681,132 +912,111 @@ static lh_status lh_hdr_read_lhex(lh_stream *io, lh_hdr_meta *meta, unsigned cha
         unsigned char *ext_ptr;
         unsigned char *ext_lim;
         int blk_len;
-        char dirbuf[512];
+        unsigned char blk_type;
+        char *dirbuf;
         size_t dir_len;
-        char *combined;
-        size_t dlen;
-        size_t flen;
+        unsigned char *tmp;
+        size_t plen;
+        size_t j;
+        lh_status est;
 
+        dirbuf = (char *)malloc(512);
+        if (!dirbuf) {
+            return LH_ERR_NO_MEMORY;
+        }
         dirbuf[0] = '\0';
         dir_len = 0;
+        est = LH_OK;
         if (header_level != 2) {
             lh_setup_get(data + header_size);
             ext_ptr = lh_get_ptr;
             ext_lim = data + LH_HDR_BUF;
             while ((blk_len = (int)lh_get_word()) != 0) {
                 if ((size_t)(ext_lim - lh_get_ptr) < (size_t)blk_len) {
-                    return LH_ERR_BAD_HEADER;
+                    est = LH_ERR_BAD_HEADER;
+                    break;
                 }
                 if (lh_stream_read(io, lh_get_ptr, (size_t)blk_len) != (size_t)blk_len) {
-                    return LH_ERR_TRUNCATED;
+                    est = LH_ERR_TRUNCATED;
+                    break;
                 }
-                switch (lh_get_byte()) {
-                case 1:
-                    free(meta->filename);
-                    meta->filename = NULL;
-                    if (blk_len > 3) {
-                        meta->filename = (char *)malloc((size_t)blk_len - 2u);
-                        if (!meta->filename) {
-                            return LH_ERR_NO_MEMORY;
+                blk_type = (unsigned char)lh_get_byte();
+                plen = 0;
+                if (blk_len > 3) {
+                    plen = (size_t)blk_len - 3u;
+                }
+                if (blk_type == LH_EXT_FILENAME
+                    || blk_type == LH_EXT_PATH
+                    || blk_type == LH_EXT_COMMENT
+                    || blk_type == LH_EXT_UTF16_FILENAME
+                    || blk_type == LH_EXT_UTF16_PATH
+                    || blk_type == LH_EXT_UTF16_COMMENT
+                    || blk_type == LH_EXT_SNAPSHOT) {
+                    tmp = NULL;
+                    if (plen > 0) {
+                        tmp = (unsigned char *)malloc(plen);
+                        if (!tmp) {
+                            est = LH_ERR_NO_MEMORY;
+                            break;
                         }
-                        for (i = 0; i < blk_len - 3; i++) {
-                            meta->filename[i] = (char)lh_get_byte();
+                        for (j = 0; j < plen; j++) {
+                            tmp[j] = (unsigned char)lh_get_byte();
                         }
-                        meta->filename[blk_len - 3] = '\0';
                     }
-                    break;
-                case 2:
-                    if (blk_len > 3 && (size_t)blk_len - 3u < sizeof(dirbuf)) {
-                        for (i = 0; i < blk_len - 3; i++) {
-                            dirbuf[i] = (char)lh_get_byte();
-                            if (dirbuf[i] == LH_PATH_SEP) {
-                                dirbuf[i] = '/';
-                            }
-                        }
-                        dirbuf[blk_len - 3] = '\0';
-                        dir_len = (size_t)(blk_len - 3);
+                    if (blk_type == LH_EXT_FILENAME) {
+                        est = lh_ext_set_legacy_name(meta, tmp, plen);
+                    } else if (blk_type == LH_EXT_PATH) {
+                        est = lh_ext_set_legacy_dir(dirbuf, 512,
+                            &dir_len, meta->have_utf16_dir, tmp, plen);
+                    } else if (blk_type == LH_EXT_COMMENT) {
+                        est = lh_ext_set_legacy_comment(meta, tmp, plen);
+                    } else if (blk_type == LH_EXT_UTF16_FILENAME) {
+                        est = lh_ext_set_utf16_name(meta, tmp, plen);
+                    } else if (blk_type == LH_EXT_UTF16_PATH) {
+                        est = lh_ext_set_utf16_dir(meta, dirbuf,
+                            512, &dir_len, tmp, plen);
+                    } else if (blk_type == LH_EXT_UTF16_COMMENT) {
+                        est = lh_ext_set_utf16_comment(meta, tmp, plen);
                     } else {
-                        lh_setup_get(lh_get_ptr + (size_t)blk_len - 3u);
+                        est = lh_ext_set_snapshot(meta, tmp, plen);
                     }
-                    break;
-                case LH_EXT_COMMENT:
-                    free(meta->comment);
-                    meta->comment = NULL;
-                    if (blk_len > 3) {
-                        meta->comment = (char *)malloc((size_t)blk_len - 2u);
-                        if (!meta->comment) {
-                            return LH_ERR_NO_MEMORY;
-                        }
-                        for (i = 0; i < blk_len - 3; i++) {
-                            meta->comment[i] = (char)lh_get_byte();
-                        }
-                        meta->comment[blk_len - 3] = '\0';
+                    free(tmp);
+                    if (est != LH_OK) {
+                        break;
                     }
-                    break;
-                case 0x50:
+                } else if (blk_type == 0x50) {
                     if (extend_type == (int)'U') {
                         (void)lh_get_word();
                     } else {
-                        lh_setup_get(lh_get_ptr + (size_t)blk_len - 3u);
+                        lh_setup_get(lh_get_ptr + plen);
                     }
-                    break;
-                case 0x51:
+                } else if (blk_type == 0x51) {
                     if (extend_type == (int)'U') {
                         (void)lh_get_word();
                         (void)lh_get_word();
                     } else {
-                        lh_setup_get(lh_get_ptr + (size_t)blk_len - 3u);
+                        lh_setup_get(lh_get_ptr + plen);
                     }
-                    break;
-                case 0x54:
+                } else if (blk_type == 0x54) {
                     if (extend_type == (int)'U') {
                         (void)lh_get_longword();
                     } else {
-                        lh_setup_get(lh_get_ptr + (size_t)blk_len - 3u);
+                        lh_setup_get(lh_get_ptr + plen);
                     }
-                    break;
-                default:
-                    lh_setup_get(lh_get_ptr + (size_t)blk_len - 3u);
-                    break;
+                } else {
+                    lh_setup_get(lh_get_ptr + plen);
                 }
             }
-            if (lh_get_ptr - ext_ptr != 2) {
+            if (est == LH_OK && lh_get_ptr - ext_ptr != 2) {
                 meta->packed_size -= (unsigned long)(lh_get_ptr - ext_ptr - 2);
             }
         }
-        if (dir_len > 0 && meta->filename && meta->filename[0]) {
-            dlen = dir_len;
-            flen = strlen(meta->filename);
-            combined = (char *)malloc(dlen + flen + 2u);
-            if (!combined) {
-                return LH_ERR_NO_MEMORY;
-            }
-            memcpy(combined, dirbuf, dlen);
-            if (dlen > 0 && dirbuf[dlen - 1] != '/' && dirbuf[dlen - 1] != ':') {
-                combined[dlen] = '/';
-                dlen++;
-            }
-            memcpy(combined + dlen, meta->filename, flen + 1u);
-            free(meta->filename);
-            meta->filename = combined;
-        } else if (dir_len > 0
-            && (meta->filename == NULL || meta->filename[0] == '\0')) {
-            free(meta->filename);
-            meta->filename = NULL;
-            dlen = dir_len;
-            while (dlen > 0
-                && (dirbuf[dlen - 1] == '/' || dirbuf[dlen - 1] == ':')) {
-                dlen--;
-            }
-            if (dlen == 0) {
-                return LH_ERR_BAD_HEADER;
-            }
-            meta->filename = (char *)malloc(dlen + 1u);
-            if (!meta->filename) {
-                return LH_ERR_NO_MEMORY;
-            }
-            memcpy(meta->filename, dirbuf, dlen);
-            meta->filename[dlen] = '\0';
+        if (est == LH_OK) {
+            est = lh_ext_combine_dir_file(meta, dirbuf, dir_len);
+        }
+        free(dirbuf);
+        if (est != LH_OK) {
+            return est;
         }
     }
 
@@ -815,7 +1025,7 @@ static lh_status lh_hdr_read_lhex(lh_stream *io, lh_hdr_meta *meta, unsigned cha
 
 lh_status lh_hdr_read(lh_stream *io, lh_hdr_meta *meta, unsigned char write_level)
 {
-    unsigned char buf[LH_HDR_BUF];
+    unsigned char *buf;
     unsigned char hdr_len;
     int header_size;
     int header_level;
@@ -828,19 +1038,27 @@ lh_status lh_hdr_read(lh_stream *io, lh_hdr_meta *meta, unsigned char write_leve
         return LH_ERR_INVALID_ARG;
     }
     lh_hdr_meta_clear(meta);
-    memset(buf, 0, sizeof(buf));
+    buf = (unsigned char *)malloc(LH_HDR_BUF);
+    if (!buf) {
+        return LH_ERR_NO_MEMORY;
+    }
+    memset(buf, 0, LH_HDR_BUF);
 
     n = lh_stream_read(io, &hdr_len, 1);
     if (n != 1) {
+        free(buf);
         return LH_ERR_TRUNCATED;
     }
     if (hdr_len == 0) {
+        free(buf);
         return LH_ERR_TRUNCATED;
     }
     if (hdr_len < 20) {
+        free(buf);
         return LH_ERR_BAD_HEADER;
     }
     if ((size_t)hdr_len >= LH_HDR_BUF - 4u) {
+        free(buf);
         return LH_ERR_BAD_HEADER;
     }
 
@@ -853,6 +1071,7 @@ lh_status lh_hdr_read(lh_stream *io, lh_hdr_meta *meta, unsigned char write_leve
      */
     n = lh_stream_read(io, buf + LH_I_CHECKSUM, (size_t)header_size - 1u);
     if (n != (size_t)header_size - 1u) {
+        free(buf);
         return LH_ERR_TRUNCATED;
     }
     header_level = (int)buf[LH_I_LEVEL];
@@ -863,16 +1082,19 @@ lh_status lh_hdr_read(lh_stream *io, lh_hdr_meta *meta, unsigned char write_leve
         initial_size = header_size;
         header_size = (int)buf[0] + (int)((unsigned int)buf[1] << 8);
         if (header_size < 26 || header_size >= LH_HDR_BUF - 4) {
+            free(buf);
             return LH_ERR_BAD_HEADER;
         }
         if (header_size > initial_size) {
             n = lh_stream_read(io, buf + initial_size,
                 (size_t)header_size - (size_t)initial_size);
             if (n != (size_t)header_size - (size_t)initial_size) {
+                free(buf);
                 return LH_ERR_TRUNCATED;
             }
         }
     } else if (lh_stream_read(io, buf + header_size, 2) != 2) {
+        free(buf);
         return LH_ERR_TRUNCATED;
     }
 
@@ -881,17 +1103,20 @@ lh_status lh_hdr_read(lh_stream *io, lh_hdr_meta *meta, unsigned char write_leve
      * LArc uses -lzN-; PMarc uses -pmN-.  Do not require "-lh" only.
      */
     if (buf[LH_I_METHOD] != '-' || buf[LH_I_METHOD + 4] != '-') {
+        free(buf);
         return LH_ERR_BAD_HEADER;
     }
 
     if (header_level == 2) {
         st = lh_hdr_read_level2(io, meta, buf);
         lh_hdr_debug("read", io, meta, st);
+        free(buf);
         return st;
     }
 
     st = lh_hdr_read_lhex(io, meta, buf);
     lh_hdr_debug("read", io, meta, st);
+    free(buf);
     return st;
 }
 
@@ -980,9 +1205,9 @@ static void lh_hdr_split_path(
 
 lh_status lh_hdr_write(lh_stream *io, const lh_hdr_meta *meta, unsigned char write_level)
 {
-    unsigned char buf[LH_HDR_BUF];
-    char basename[256];
-    unsigned char dirpath[512];
+    unsigned char *buf;
+    char *basename;
+    unsigned char *dirpath;
     size_t dirpath_len;
     size_t name_len;
     size_t comment_len;
@@ -992,9 +1217,30 @@ lh_status lh_hdr_write(lh_stream *io, const lh_hdr_meta *meta, unsigned char wri
     unsigned char checksum;
     size_t i;
     const char *write_name;
+    lh_status st;
+    size_t hcrc_pos;
+    unsigned short hcrc;
+    unsigned char os_id;
+    unsigned char *u16;
+    size_t u16_len;
+    unsigned char *cpay;
+    size_t cpay_len;
+
+    buf = NULL;
+    basename = NULL;
+    dirpath = NULL;
+    st = LH_OK;
 
     if (!io || !LH_STREAM_OPEN(io) || !meta || !meta->filename) {
         return LH_ERR_INVALID_ARG;
+    }
+
+    buf = (unsigned char *)malloc(LH_HDR_BUF);
+    basename = (char *)malloc(256);
+    dirpath = (unsigned char *)malloc(512);
+    if (!buf || !basename || !dirpath) {
+        st = LH_ERR_NO_MEMORY;
+        goto done;
     }
 
     /*
@@ -1005,21 +1251,18 @@ lh_status lh_hdr_write(lh_stream *io, const lh_hdr_meta *meta, unsigned char wri
      * there so SetProtection round-trips.
      */
     if (write_level >= 2) {
-        size_t hcrc_pos;
-        unsigned short hcrc;
-        unsigned char os_id;
-
-        lh_hdr_split_path(meta->filename, basename, sizeof(basename),
-            dirpath, sizeof(dirpath), &dirpath_len);
+        lh_hdr_split_path(meta->filename, basename, 256,
+            dirpath, 512, &dirpath_len);
         if (!basename[0]) {
-            return LH_ERR_INVALID_ARG;
+            st = LH_ERR_INVALID_ARG;
+            goto done;
         }
         name_len = strlen(basename);
         comment_len = (meta->comment && meta->comment[0])
             ? strlen(meta->comment) : 0;
         os_id = meta->os_id ? meta->os_id : LH_OS_AMIGA;
 
-        memset(buf, 0, sizeof(buf));
+        memset(buf, 0, LH_HDR_BUF);
         memcpy(buf + LH_I_METHOD, meta->method_sig, LH_SIG_LEN);
         lh_write_le32(buf + LH_I_PACKED, meta->packed_size);
         lh_write_le32(buf + LH_I_ORIGINAL, meta->original_size);
@@ -1035,42 +1278,118 @@ lh_status lh_hdr_write(lh_stream *io, const lh_hdr_meta *meta, unsigned char wri
         pos = 24;
 
         /* Common header first: size 5, type 0, CRC placeholder. */
-        n = lh_hdr_put_ext(buf, sizeof(buf), pos, LH_EXT_COMMON, NULL, 2);
+        n = lh_hdr_put_ext(buf, LH_HDR_BUF, pos, LH_EXT_COMMON, NULL, 2);
         if (n == 0) {
-            return LH_ERR_BAD_HEADER;
+            st = LH_ERR_BAD_HEADER;
+            goto done;
         }
         hcrc_pos = pos + 3;
         lh_write_le16(buf + hcrc_pos, 0);
         pos += n;
 
-        n = lh_hdr_put_ext(buf, sizeof(buf), pos, LH_EXT_FILENAME,
+        n = lh_hdr_put_ext(buf, LH_HDR_BUF, pos, LH_EXT_FILENAME,
             (const unsigned char *)basename, name_len);
         if (n == 0) {
-            return LH_ERR_FILENAME_TOO_LONG;
+            st = LH_ERR_FILENAME_TOO_LONG;
+            goto done;
         }
         pos += n;
 
         if (dirpath_len > 0) {
-            n = lh_hdr_put_ext(buf, sizeof(buf), pos, LH_EXT_PATH,
+            n = lh_hdr_put_ext(buf, LH_HDR_BUF, pos, LH_EXT_PATH,
                 dirpath, dirpath_len);
             if (n == 0) {
-                return LH_ERR_FILENAME_TOO_LONG;
+                st = LH_ERR_FILENAME_TOO_LONG;
+                goto done;
             }
             pos += n;
         }
 
         if (comment_len > 0) {
-            n = lh_hdr_put_ext(buf, sizeof(buf), pos, LH_EXT_COMMENT,
+            n = lh_hdr_put_ext(buf, LH_HDR_BUF, pos, LH_EXT_COMMENT,
                 (const unsigned char *)meta->comment, comment_len);
             if (n == 0) {
-                return LH_ERR_BAD_HEADER;
+                st = LH_ERR_BAD_HEADER;
+                goto done;
+            }
+            pos += n;
+        }
+
+        /*
+         * Unlha32-compatible Unicode mirrors so Windows tools see UTF-16LE
+         * while legacy readers keep the Latin-1 0x01/0x02/0x3F fallback.
+         */
+        u16 = NULL;
+        u16_len = 0;
+        st = lh_latin1_to_utf16le(basename, &u16, &u16_len);
+        if (st != LH_OK) {
+            goto done;
+        }
+        n = lh_hdr_put_ext(buf, LH_HDR_BUF, pos, LH_EXT_UTF16_FILENAME,
+            u16, u16_len);
+        free(u16);
+        if (n == 0) {
+            st = LH_ERR_FILENAME_TOO_LONG;
+            goto done;
+        }
+        pos += n;
+
+        if (dirpath_len > 0) {
+            u16 = NULL;
+            u16_len = 0;
+            st = lh_latin1_path_to_utf16le(dirpath, dirpath_len,
+                &u16, &u16_len);
+            if (st != LH_OK) {
+                goto done;
+            }
+            n = lh_hdr_put_ext(buf, LH_HDR_BUF, pos, LH_EXT_UTF16_PATH,
+                u16, u16_len);
+            free(u16);
+            if (n == 0) {
+                st = LH_ERR_FILENAME_TOO_LONG;
+                goto done;
+            }
+            pos += n;
+        }
+
+        if (comment_len > 0) {
+            u16 = NULL;
+            u16_len = 0;
+            st = lh_latin1_to_utf16le(meta->comment, &u16, &u16_len);
+            if (st != LH_OK) {
+                goto done;
+            }
+            n = lh_hdr_put_ext(buf, LH_HDR_BUF, pos, LH_EXT_UTF16_COMMENT,
+                u16, u16_len);
+            free(u16);
+            if (n == 0) {
+                st = LH_ERR_BAD_HEADER;
+                goto done;
+            }
+            pos += n;
+        }
+
+        if (meta->have_snapshot) {
+            cpay = NULL;
+            cpay_len = 0;
+            st = lh_snapshot_pack(&meta->snapshot, &cpay, &cpay_len);
+            if (st != LH_OK) {
+                goto done;
+            }
+            n = lh_hdr_put_ext(buf, LH_HDR_BUF, pos, LH_EXT_SNAPSHOT,
+                cpay, cpay_len);
+            free(cpay);
+            if (n == 0) {
+                st = LH_ERR_BAD_HEADER;
+                goto done;
             }
             pos += n;
         }
 
         /* Terminate extension chain. */
-        if (pos + 2u > sizeof(buf)) {
-            return LH_ERR_BAD_HEADER;
+        if (pos + 2u > LH_HDR_BUF) {
+            st = LH_ERR_BAD_HEADER;
+            goto done;
         }
         lh_write_le16(buf + pos, 0);
         pos += 2;
@@ -1080,8 +1399,9 @@ lh_status lh_hdr_write(lh_stream *io, const lh_hdr_meta *meta, unsigned char wri
          * Pad one byte when needed, as classic LHA does.
          */
         if ((pos & 0xffu) == 0) {
-            if (pos + 1u > sizeof(buf)) {
-                return LH_ERR_BAD_HEADER;
+            if (pos + 1u > LH_HDR_BUF) {
+                st = LH_ERR_BAD_HEADER;
+                goto done;
             }
             buf[pos++] = 0;
         }
@@ -1091,18 +1411,21 @@ lh_status lh_hdr_write(lh_stream *io, const lh_hdr_meta *meta, unsigned char wri
         lh_write_le16(buf + hcrc_pos, hcrc);
 
         if (lh_stream_write(io, buf, pos) != pos) {
-            return LH_ERR_IO;
+            st = LH_ERR_IO;
+            goto done;
         }
-        return LH_OK;
+        st = LH_OK;
+        goto done;
     }
 
     /* Level 0/1: classic lhex layout with inline name (no comment ext). */
     write_name = meta->filename;
     name_len = strlen(write_name);
     if (name_len > 200) {
-        return LH_ERR_FILENAME_TOO_LONG;
+        st = LH_ERR_FILENAME_TOO_LONG;
+        goto done;
     }
-    memset(buf, 0, sizeof(buf));
+    memset(buf, 0, LH_HDR_BUF);
     memcpy(buf + 2, meta->method_sig, LH_SIG_LEN);
     lh_write_le32(buf + 7, meta->packed_size);
     lh_write_le32(buf + 11, meta->original_size);
@@ -1120,7 +1443,8 @@ lh_status lh_hdr_write(lh_stream *io, const lh_hdr_meta *meta, unsigned char wri
         hdr_body = 22 + name_len + 2;
     }
     if (hdr_body > 255) {
-        return LH_ERR_BAD_HEADER;
+        st = LH_ERR_BAD_HEADER;
+        goto done;
     }
     buf[0] = (unsigned char)hdr_body;
     checksum = 0;
@@ -1130,13 +1454,22 @@ lh_status lh_hdr_write(lh_stream *io, const lh_hdr_meta *meta, unsigned char wri
     buf[1] = checksum;
     /* lhex wire format: size, body[0..size-2], then 2 extension/prefetch bytes. */
     if (lh_stream_write(io, buf, 1) != 1) {
-        return LH_ERR_IO;
+        st = LH_ERR_IO;
+        goto done;
     }
     if (lh_stream_write(io, buf + 1, hdr_body - 1) != hdr_body - 1) {
-        return LH_ERR_IO;
+        st = LH_ERR_IO;
+        goto done;
     }
     if (lh_stream_write(io, buf + hdr_body, 2) != 2) {
-        return LH_ERR_IO;
+        st = LH_ERR_IO;
+        goto done;
     }
-    return LH_OK;
+    st = LH_OK;
+
+done:
+    free(buf);
+    free(basename);
+    free(dirpath);
+    return st;
 }

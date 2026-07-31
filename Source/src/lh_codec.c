@@ -411,7 +411,7 @@ long lh_compress_lh1(void * inBuf, unsigned long inSize, void * outBuf, unsigned
     unsigned char *output = (unsigned char *)outBuf;
     unsigned long outPos = 0;
     unsigned long i;
-    unsigned char window[LH_RING_BUFFER_SIZE];
+    unsigned char *window = NULL;
     unsigned long windowPos = 0;
     unsigned long literalCount = 0;
     struct lh_code_lookup *codeLookup = NULL;
@@ -428,16 +428,22 @@ long lh_compress_lh1(void * inBuf, unsigned long inSize, void * outBuf, unsigned
         return LH_ERR_NO_MEMORY;
     }
     
-    /* Heap tables: distLookup alone is ~32 KiB (exceeds m68k stack displacement). */
+    /* Heap: 4K window + tables must not live on Amiga stack. */
+    window = (unsigned char *)malloc(LH_RING_BUFFER_SIZE);
+    if (!window) {
+        return LH_ERR_NO_MEMORY;
+    }
     codeLookup = (struct lh_code_lookup *)malloc(
         (256u + LH_MAX_MATCH_LENGTH) * sizeof(struct lh_code_lookup));
     if (!codeLookup) {
+        free(window);
         return LH_ERR_NO_MEMORY;
     }
     distLookup = (struct lh_code_lookup *)malloc(
         (LH_RING_BUFFER_SIZE + 1u) * sizeof(struct lh_code_lookup));
     if (!distLookup) {
         free(codeLookup);
+        free(window);
         return LH_ERR_NO_MEMORY;
     }
     
@@ -508,6 +514,9 @@ cleanup:
     if (codeLookup) {
         free(codeLookup);
     }
+    if (window) {
+        free(window);
+    }
     return result;
 }
 
@@ -518,7 +527,7 @@ long lh_compress_lh5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
     unsigned long i;
     unsigned char *window = NULL;
     unsigned long windowPos = 0;
-    unsigned long hashTable[256];
+    unsigned long *hashTable = NULL;
     unsigned long *hashLinks = NULL;
     const unsigned long NUM_LITERAL_CODES = 256;
     const unsigned long NUM_LEN_CODES = 16;
@@ -558,14 +567,21 @@ long lh_compress_lh5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
     if (!window) {
         return LH_ERR_NO_MEMORY;
     }
+    hashTable = (unsigned long *)malloc(256 * sizeof(unsigned long));
+    if (!hashTable) {
+        free(window);
+        return LH_ERR_NO_MEMORY;
+    }
     hashLinks = (unsigned long *)malloc(LH_RING_BUFFER_SIZE * sizeof(unsigned long));
     if (!hashLinks) {
+        free(hashTable);
         free(window);
         return LH_ERR_NO_MEMORY;
     }
     codeLookup = (struct lh_code_lookup *)malloc(NUM_CODES * sizeof(struct lh_code_lookup));
     if (!codeLookup) {
         free(hashLinks);
+        free(hashTable);
         free(window);
         return LH_ERR_NO_MEMORY;
     }
@@ -573,6 +589,7 @@ long lh_compress_lh5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
     if (!distLookup) {
         free(codeLookup);
         free(hashLinks);
+        free(hashTable);
         free(window);
         return LH_ERR_NO_MEMORY;
     }
@@ -617,31 +634,43 @@ long lh_compress_lh5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
         hash = firstByte;
         matchPos = hashTable[hash];
         
-        /* Find longest match */
-        while (matchPos < LH_RING_BUFFER_SIZE) {
-            /* Check if we have a match */
-            matchLength = 0;
-            while (matchLength < lookahead && 
-                   curPos + matchLength < inSize && 
-                   window[(matchPos + matchLength) % LH_RING_BUFFER_SIZE] == input[curPos + matchLength]) {
-                matchLength++;
-            }
-            
-            /* If we found a match that's long enough and better than current best */
-            if (matchLength >= MATCH_LENGTH_THRESHOLD && matchLength > bestLength) {
-                bestLength = matchLength;
-                bestOffset = (windowPos - matchPos) & (LH_RING_BUFFER_SIZE - 1);
-                
-                /* If we found a very good match, stop searching */
-                if (matchLength >= 32) {
-                    break;
+        /* Find longest match (cap chain length — ring wrap can cycle). */
+        {
+            unsigned long chain;
+
+            chain = 0;
+            while (matchPos < LH_RING_BUFFER_SIZE && chain < 256UL) {
+                chain++;
+                matchLength = 0;
+                while (matchLength < lookahead &&
+                       curPos + matchLength < inSize &&
+                       window[(matchPos + matchLength) % LH_RING_BUFFER_SIZE]
+                           == input[curPos + matchLength]) {
+                    matchLength++;
                 }
+
+                if (matchLength >= MATCH_LENGTH_THRESHOLD
+                        && matchLength > bestLength) {
+                    bestLength = matchLength;
+                    bestOffset = (windowPos - matchPos)
+                        & (LH_RING_BUFFER_SIZE - 1);
+                    if (matchLength >= 32) {
+                        break;
+                    }
+                }
+
+                matchPos = hashLinks[matchPos];
             }
-            
-            /* Try next match in chain */
-            matchPos = hashLinks[matchPos];
         }
-        
+
+        /* Never consume more than the current lookahead (unsigned). */
+        if (bestLength > lookahead) {
+            bestLength = lookahead;
+        }
+        if (curPos < inSize && bestLength > (inSize - curPos)) {
+            bestLength = inSize - curPos;
+        }
+
         /* Update frequency tables based on match/literal decision */
         if (bestLength >= MATCH_LENGTH_THRESHOLD) {
             /* We found a match - encode as length and distance */
@@ -662,26 +691,30 @@ long lh_compress_lh5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
             } else {
                 distCode = 32 + ((bestOffset - 88) >> 3);
             }
+            if (distCode >= DISTANCE_TABLE_SIZE) {
+                distCode = DISTANCE_TABLE_SIZE - 1;
+            }
             
             distLookup[distCode].freq++;
             
-            /* Advance by match length */
+            /*
+             * Advance by match length.  Near EOF startPos may already be
+             * at inSize while curPos = startPos - lookahead still lags;
+             * always decrement lookahead so the encode cursor moves.
+             */
             for (i = 0; i < bestLength; i++) {
+                if (lookahead == 0) {
+                    break;
+                }
                 if (startPos < inSize) {
-                    /* Insert into window */
                     window[windowPos] = input[startPos];
-                    
-                    /* Update hash chain */
                     hash = input[startPos];
                     hashLinks[windowPos] = hashTable[hash];
                     hashTable[hash] = windowPos;
-                    
-                    /* Move window position */
                     windowPos = (windowPos + 1) & (LH_RING_BUFFER_SIZE - 1);
-                    
                     startPos++;
-                    lookahead--;
                 }
+                lookahead--;
             }
         } else {
             /* No good match found - encode as literal */
@@ -698,7 +731,9 @@ long lh_compress_lh5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
             windowPos = (windowPos + 1) & (LH_RING_BUFFER_SIZE - 1);
             
             startPos++;
-            lookahead--;
+            if (lookahead > 0) {
+                lookahead--;
+            }
         }
         
         /* Refill lookahead buffer */
@@ -808,7 +843,7 @@ long lh_compress_lh5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
     startPos = lookahead;
     
     /* Process input data for compression */
-    while (startPos - lookahead < inSize) {
+    while (lookahead <= startPos && (startPos - lookahead) < inSize) {
         bestLength = 0;
         bestOffset = 0;
         curPos = startPos - lookahead;
@@ -821,31 +856,41 @@ long lh_compress_lh5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
         hash = firstByte;
         matchPos = hashTable[hash];
         
-        /* Find longest match */
-        while (matchPos < LH_RING_BUFFER_SIZE) {
-            /* Check if we have a match */
-            matchLength = 0;
-            while (matchLength < lookahead && 
-                   curPos + matchLength < inSize && 
-                   window[(matchPos + matchLength) % LH_RING_BUFFER_SIZE] == input[curPos + matchLength]) {
-                matchLength++;
-            }
-            
-            /* If we found a match that's long enough and better than current best */
-            if (matchLength >= MATCH_LENGTH_THRESHOLD && matchLength > bestLength) {
-                bestLength = matchLength;
-                bestOffset = (windowPos - matchPos) & (LH_RING_BUFFER_SIZE - 1);
-                
-                /* If we found a very good match, stop searching */
-                if (matchLength >= 32) {
-                    break;
+        {
+            unsigned long chain;
+
+            chain = 0;
+            while (matchPos < LH_RING_BUFFER_SIZE && chain < 256UL) {
+                chain++;
+                matchLength = 0;
+                while (matchLength < lookahead &&
+                       curPos + matchLength < inSize &&
+                       window[(matchPos + matchLength) % LH_RING_BUFFER_SIZE]
+                           == input[curPos + matchLength]) {
+                    matchLength++;
                 }
+
+                if (matchLength >= MATCH_LENGTH_THRESHOLD
+                        && matchLength > bestLength) {
+                    bestLength = matchLength;
+                    bestOffset = (windowPos - matchPos)
+                        & (LH_RING_BUFFER_SIZE - 1);
+                    if (matchLength >= 32) {
+                        break;
+                    }
+                }
+
+                matchPos = hashLinks[matchPos];
             }
-            
-            /* Try next match in chain */
-            matchPos = hashLinks[matchPos];
         }
-        
+
+        if (bestLength > lookahead) {
+            bestLength = lookahead;
+        }
+        if (curPos < inSize && bestLength > (inSize - curPos)) {
+            bestLength = inSize - curPos;
+        }
+
         /* Encode match or literal */
         if (bestLength >= MATCH_LENGTH_THRESHOLD) {
             /* We found a match - encode as length and distance */
@@ -879,6 +924,11 @@ long lh_compress_lh5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
                 extraBits = 3;
                 extraBitValue = (bestOffset - 88) & 7;
             }
+            if (distCode >= DISTANCE_TABLE_SIZE) {
+                distCode = DISTANCE_TABLE_SIZE - 1;
+                extraBits = 0;
+                extraBitValue = 0;
+            }
             
             /* Encode distance code */
             if (lh_encode_write_bits(distCode, distLookup[distCode].codeLen,
@@ -896,23 +946,24 @@ long lh_compress_lh5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
                 }
             }
             
-            /* Advance by match length */
+            /*
+             * Advance by match length.  Must always reduce lookahead near
+             * EOF; otherwise curPos never moves and this loop spins
+             * (CheckSys Prefs.lha lockup on repetitive .info / prefs).
+             */
             for (i = 0; i < bestLength; i++) {
+                if (lookahead == 0) {
+                    break;
+                }
                 if (startPos < inSize) {
-                    /* Insert into window */
                     window[windowPos] = input[startPos];
-                    
-                    /* Update hash chain */
                     hash = input[startPos];
                     hashLinks[windowPos] = hashTable[hash];
                     hashTable[hash] = windowPos;
-                    
-                    /* Move window position */
                     windowPos = (windowPos + 1) & (LH_RING_BUFFER_SIZE - 1);
-                    
                     startPos++;
-                    lookahead--;
                 }
+                lookahead--;
             }
         } else {
             /* No good match found - encode as literal */
@@ -933,7 +984,9 @@ long lh_compress_lh5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
             windowPos = (windowPos + 1) & (LH_RING_BUFFER_SIZE - 1);
             
             startPos++;
-            lookahead--;
+            if (lookahead > 0) {
+                lookahead--;
+            }
         }
         
         /* Refill lookahead buffer */
@@ -964,6 +1017,9 @@ cleanup:
     }
     if (hashLinks) {
         free(hashLinks);
+    }
+    if (hashTable) {
+        free(hashTable);
     }
     if (window) {
         free(window);
@@ -1916,16 +1972,24 @@ long lh_decompress_lzs(void * inBuf, unsigned long inSize, void * outBuf, unsign
     unsigned char *output = (unsigned char *)outBuf;
     unsigned long inPos = 0;
     unsigned long outPos = 0;
-    unsigned char window[LZS_WINDOW_SIZE];
+    unsigned char *window;
     unsigned long windowPos = 0;
     unsigned long i, len, offset;
     unsigned char flags, mask;
+    long result;
     
+    window = NULL;
+    result = LH_OK;
+
     /* Check parameters */
     if (!inBuf || !outBuf || inSize == 0 || outSize == 0) {
         return LH_ERR_INVALID_ARG;
     }
     
+    window = (unsigned char *)malloc(LZS_WINDOW_SIZE);
+    if (!window) {
+        return LH_ERR_NO_MEMORY;
+    }
     /* Clear window */
     memset(window, 0, LZS_WINDOW_SIZE);
     
@@ -1954,7 +2018,8 @@ long lh_decompress_lzs(void * inBuf, unsigned long inSize, void * outBuf, unsign
                 unsigned char b = window[(offset + i) % LZS_WINDOW_SIZE];
                 
                 if (outPos >= outSize) {
-                    return LH_ERR_INVALID_ARG; /* Output buffer overflow */
+                    result = LH_ERR_INVALID_ARG;
+                    goto done;
                 }
                 
                 output[outPos++] = b;
@@ -1968,7 +2033,8 @@ long lh_decompress_lzs(void * inBuf, unsigned long inSize, void * outBuf, unsign
             if (inPos >= inSize) break;
             
             if (outPos >= outSize) {
-                return LH_ERR_INVALID_ARG; /* Output buffer overflow */
+                result = LH_ERR_INVALID_ARG;
+                goto done;
             }
             
             output[outPos++] = input[inPos];
@@ -1983,7 +2049,10 @@ long lh_decompress_lzs(void * inBuf, unsigned long inSize, void * outBuf, unsign
     }
     
     /* Return success if we decompressed the expected size */
-    return (outPos == outSize) ? LH_OK : LH_ERR_INVALID_ARG;
+    result = (outPos == outSize) ? LH_OK : LH_ERR_INVALID_ARG;
+done:
+    free(window);
+    return result;
 }
 
 long lh_compress_lzs(void * inBuf, unsigned long inSize, void * outBuf, unsigned long *outSize) {
@@ -1991,12 +2060,15 @@ long lh_compress_lzs(void * inBuf, unsigned long inSize, void * outBuf, unsigned
     unsigned char *output = (unsigned char *)outBuf;
     unsigned long outPos = 0;
     unsigned long inPos = 0;
-    unsigned long i, j;
-    unsigned char window[LZS_WINDOW_SIZE];
+    unsigned long i;
+    unsigned char *window;
     unsigned long windowPos = 0;
-    unsigned char flagByte = 0;
     unsigned long flagPos = 0;
     unsigned long flagBit = 0x80;
+    long result;
+
+    window = NULL;
+    result = LH_OK;
     
     /* Check parameters */
     if (!inBuf || !outBuf || inSize == 0 || *outSize < inSize) {
@@ -2007,12 +2079,20 @@ long lh_compress_lzs(void * inBuf, unsigned long inSize, void * outBuf, unsigned
     if (*outSize < inSize + (inSize / 8) + 12) {
         return LH_ERR_NO_MEMORY;
     }
+
+    window = (unsigned char *)malloc(LZS_WINDOW_SIZE);
+    if (!window) {
+        return LH_ERR_NO_MEMORY;
+    }
     
     /* Initialize window with zeros */
     memset(window, 0, LZS_WINDOW_SIZE);
     
     /* Reserve space for the first flag byte */
-    if (outPos >= *outSize) return LH_ERR_NO_MEMORY;
+    if (outPos >= *outSize) {
+        result = LH_ERR_NO_MEMORY;
+        goto done;
+    }
     flagPos = outPos++;
     output[flagPos] = 0;
     
@@ -2024,7 +2104,10 @@ long lh_compress_lzs(void * inBuf, unsigned long inSize, void * outBuf, unsigned
         /* Check if we need a new flag byte */
         if (flagBit == 0) {
             /* Start a new flag byte */
-            if (outPos >= *outSize) return LH_ERR_NO_MEMORY;
+            if (outPos >= *outSize) {
+                result = LH_ERR_NO_MEMORY;
+                goto done;
+            }
             flagPos = outPos++;
             output[flagPos] = 0;
             flagBit = 0x80;
@@ -2061,7 +2144,10 @@ long lh_compress_lzs(void * inBuf, unsigned long inSize, void * outBuf, unsigned
             output[flagPos] |= flagBit; /* Set flag bit for match */
             
             /* Output match offset and length */
-            if (outPos + 1 >= *outSize) return LH_ERR_NO_MEMORY;
+            if (outPos + 1 >= *outSize) {
+                result = LH_ERR_NO_MEMORY;
+                goto done;
+            }
             
             output[outPos++] = bestOffset & 0xFF;
             output[outPos++] = ((bestOffset >> 4) & 0xF0) | ((bestLength - LZS_BREAK_EVEN) & 0x0F);
@@ -2074,7 +2160,10 @@ long lh_compress_lzs(void * inBuf, unsigned long inSize, void * outBuf, unsigned
             }
         } else {
             /* Output a literal byte (flag bit already clear) */
-            if (outPos >= *outSize) return LH_ERR_NO_MEMORY;
+            if (outPos >= *outSize) {
+                result = LH_ERR_NO_MEMORY;
+                goto done;
+            }
             output[outPos++] = input[inPos];
             
             /* Update window */
@@ -2090,7 +2179,9 @@ long lh_compress_lzs(void * inBuf, unsigned long inSize, void * outBuf, unsigned
     /* Update output size */
     *outSize = outPos;
     
-    return LH_OK;
+done:
+    free(window);
+    return result;
 }
 
 /* Helper function to check buffer boundaries */
@@ -2286,21 +2377,29 @@ long lh_decompress_lz5(void * inBuf, unsigned long inSize, void * outBuf, unsign
     unsigned char *output = (unsigned char *)outBuf;
     unsigned long outPos = 0;
     unsigned long inPos = 0;
-    unsigned long i, j;
-    unsigned char window[4096];  /* 4K sliding window */
+    unsigned long i;
+    unsigned char *window;
     unsigned long windowPos = 0;
     unsigned char flagByte = 0;
-    unsigned long flagPos = 0;
     unsigned long flagBit = 0x80;
     unsigned char offset;
     unsigned char length;
     unsigned char b;
     unsigned long matchOffset;
     unsigned long matchLength;
+    long result;
+
+    window = NULL;
+    result = LH_OK;
     
     /* Check parameters */
     if (!inBuf || !outBuf || inSize == 0 || outSize == 0) {
         return LH_ERR_INVALID_ARG;
+    }
+
+    window = (unsigned char *)malloc(4096);
+    if (!window) {
+        return LH_ERR_NO_MEMORY;
     }
     
     /* Initialize window with zeros */
@@ -2355,7 +2454,9 @@ long lh_decompress_lz5(void * inBuf, unsigned long inSize, void * outBuf, unsign
     }
     
     /* Return success if we decompressed the expected size */
-    return (outPos == outSize) ? LH_OK : LH_ERR_INVALID_ARG;
+    result = (outPos == outSize) ? LH_OK : LH_ERR_INVALID_ARG;
+    free(window);
+    return result;
 }
 
 /* LZ5 compression - 4 KiB sliding window, max 17 bytes match length (LArc format) */
@@ -2364,12 +2465,15 @@ long lh_compress_lz5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
     unsigned char *output = (unsigned char *)outBuf;
     unsigned long outPos = 0;
     unsigned long inPos = 0;
-    unsigned long i, j;
-    unsigned char window[4096];  /* 4K sliding window */
+    unsigned long i;
+    unsigned char *window;
     unsigned long windowPos = 0;
-    unsigned char flagByte = 0;
     unsigned long flagPos = 0;
     unsigned long flagBit = 0x80;
+    long result;
+
+    window = NULL;
+    result = LH_OK;
     
     /* Check parameters */
     if (!inBuf || !outBuf || inSize == 0 || *outSize < inSize) {
@@ -2380,12 +2484,20 @@ long lh_compress_lz5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
     if (*outSize < inSize + (inSize / 8) + 12) {
         return LH_ERR_NO_MEMORY;
     }
+
+    window = (unsigned char *)malloc(4096);
+    if (!window) {
+        return LH_ERR_NO_MEMORY;
+    }
     
     /* Initialize window with zeros */
     memset(window, 0, 4096);
     
     /* Reserve space for the first flag byte */
-    if (outPos >= *outSize) return LH_ERR_NO_MEMORY;
+    if (outPos >= *outSize) {
+        result = LH_ERR_NO_MEMORY;
+        goto done;
+    }
     flagPos = outPos++;
     output[flagPos] = 0;
     
@@ -2396,7 +2508,10 @@ long lh_compress_lz5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
         
         /* Check if we need a new flag byte */
         if (flagBit == 0) {
-            if (outPos >= *outSize) return LH_ERR_NO_MEMORY;
+            if (outPos >= *outSize) {
+                result = LH_ERR_NO_MEMORY;
+                goto done;
+            }
             flagPos = outPos++;
             output[flagPos] = 0;
             flagBit = 0x80;
@@ -2433,7 +2548,10 @@ long lh_compress_lz5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
             output[flagPos] |= flagBit; /* Set flag bit for match */
             
             /* Output match offset and length (12-bit offset, 4-bit length) */
-            if (outPos + 1 >= *outSize) return LH_ERR_NO_MEMORY;
+            if (outPos + 1 >= *outSize) {
+                result = LH_ERR_NO_MEMORY;
+                goto done;
+            }
             
             output[outPos++] = bestOffset & 0xFF;
             output[outPos++] = ((bestOffset >> 4) & 0xF0) | ((bestLength - 3) & 0x0F);
@@ -2446,7 +2564,10 @@ long lh_compress_lz5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
             }
         } else {
             /* Output a literal byte (flag bit already clear) */
-            if (outPos >= *outSize) return LH_ERR_NO_MEMORY;
+            if (outPos >= *outSize) {
+                result = LH_ERR_NO_MEMORY;
+                goto done;
+            }
             output[outPos++] = input[inPos];
             
             /* Update window */
@@ -2462,7 +2583,9 @@ long lh_compress_lz5(void * inBuf, unsigned long inSize, void * outBuf, unsigned
     /* Update output size */
     *outSize = outPos;
     
-    return LH_OK;
+done:
+    free(window);
+    return result;
 }
 
 /* LZ4 decompression - No compression (LArc format) */

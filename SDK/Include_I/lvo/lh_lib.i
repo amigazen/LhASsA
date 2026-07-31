@@ -44,4 +44,5 @@ _LVOLhExtractEntry equ -192
 _LVOLhTestEntry equ -198
 _LVOLhPrintEntry equ -204
 _LVOLhErr equ -210
+_LVOLhGetSnapshot equ -216
 

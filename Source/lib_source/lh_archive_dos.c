@@ -30,6 +30,7 @@
 #define ST_USERDIR (2L)
 #endif
 
+#include "/include/libraries/lh.h"
 #include "/include/lh.h"
 #include "lh/lhbase.h"
 #include "lh_archive_dos.h"
@@ -86,7 +87,7 @@ static void lh_arc_remove_path(STRPTR path)
 {
     BPTR fh;
     LONG retry;
-    char aside[560];
+    char *aside;
     LONG plen;
 
     if (!path || !path[0]) {
@@ -113,7 +114,11 @@ static void lh_arc_remove_path(STRPTR path)
         }
     }
     plen = (LONG)strlen((const char *)path);
-    if (plen <= 0 || plen >= (LONG)sizeof(aside) - 4) {
+    if (plen <= 0 || plen >= 560 - 4) {
+        return;
+    }
+    aside = (char *)malloc(560);
+    if (!aside) {
         return;
     }
     strcpy(aside, (const char *)path);
@@ -126,6 +131,7 @@ static void lh_arc_remove_path(STRPTR path)
     if (Rename(path, (STRPTR)aside)) {
         DeleteFile((STRPTR)aside);
     }
+    free(aside);
     SetIoErr(0);
 }
 
@@ -146,6 +152,8 @@ struct lh_arc_entry_ref {
     lh_datetime dt;
     int is_directory;
     unsigned short crc;
+    int have_snapshot;
+    lh_snapshot snapshot;
 };
 
 struct LhArchive {
@@ -273,17 +281,29 @@ static int lh_arc_catalog_add(struct LhArchive *arc, const lh_entry *entry,
     ref->dt = entry->datetime;
     ref->is_directory = entry->is_directory;
     ref->crc = entry->crc;
+    ref->have_snapshot = entry->have_snapshot;
+    if (entry->have_snapshot) {
+        /* CopyMem: SAS/C large struct assignment has been unreliable. */
+        CopyMem((APTR)&entry->snapshot, (APTR)&ref->snapshot,
+            (ULONG)sizeof(ref->snapshot));
+    } else {
+        memset(&ref->snapshot, 0, sizeof(ref->snapshot));
+    }
     arc->catalog_count++;
     return 1;
 }
 
 static int lh_arc_build_catalog(struct LhArchive *arc)
 {
-    lh_entry entry;
+    lh_entry *entry;
     lh_status st;
     long hdr_off;
 
     if (!arc || !arc->reader) {
+        return 0;
+    }
+    entry = (lh_entry *)calloc(1, sizeof(*entry));
+    if (!entry) {
         return 0;
     }
     lh_arc_clear_catalog(arc);
@@ -291,24 +311,28 @@ static int lh_arc_build_catalog(struct LhArchive *arc)
     for (;;) {
         hdr_off = lh_reader_tell(arc->reader);
         if (hdr_off < 0) {
+            free(entry);
             return 0;
         }
-        memset(&entry, 0, sizeof(entry));
-        st = lh_reader_next(arc->reader, &entry);
-        if (st == LH_OK && !entry.filename) {
+        memset(entry, 0, sizeof(*entry));
+        st = lh_reader_next(arc->reader, entry);
+        if (st == LH_OK && !entry->filename) {
             break;
         }
         if (st != LH_OK) {
-            lh_entry_clear(&entry);
+            lh_entry_clear(entry);
+            free(entry);
             return 0;
         }
-        if (!lh_arc_catalog_add(arc, &entry, (unsigned long)hdr_off)) {
-            lh_entry_clear(&entry);
+        if (!lh_arc_catalog_add(arc, entry, (unsigned long)hdr_off)) {
+            lh_entry_clear(entry);
+            free(entry);
             return 0;
         }
-        lh_entry_clear(&entry);
+        lh_entry_clear(entry);
     }
     lh_reader_set_header_only(arc->reader, 0);
+    free(entry);
     return 1;
 }
 
@@ -492,20 +516,28 @@ static int lh_leaf_seen_before(struct LhArchive *arc, const char *parent,
     const char *leaf, LONG before_idx)
 {
     LONG i;
-    char prev[108];
+    char *prev;
     int is_dir;
     LONG exact;
+    int found;
 
+    prev = (char *)malloc(108);
+    if (!prev) {
+        return 0;
+    }
+    found = 0;
     for (i = 0; i < before_idx; i++) {
         if (!lh_child_leaf_from_entry(parent, arc->catalog[i].name,
-                prev, (LONG)sizeof(prev), &is_dir, i, &exact)) {
+                prev, 108L, &is_dir, i, &exact)) {
             continue;
         }
         if (lh_name_match(leaf, prev)) {
-            return 1;
+            found = 1;
+            break;
         }
     }
-    return 0;
+    free(prev);
+    return found;
 }
 
 /*
@@ -651,13 +683,28 @@ static int lh_fill_next_child(struct LhLock *lock, struct FileInfoBlock *fib)
     struct LhArchive *arc;
     const char *parent;
     LONG i;
-    char leaf[108];
-    char dirpath[512];
+    char *leaf;
+    char *dirpath;
     int is_dir;
     LONG exact;
-    struct lh_arc_entry_ref synth;
+    struct lh_arc_entry_ref *synth;
+    int ok;
+
+    leaf = NULL;
+    dirpath = NULL;
+    synth = NULL;
+    ok = 0;
 
     if (!lock || !fib || !lock->archive) {
+        return 0;
+    }
+    leaf = (char *)malloc(108);
+    dirpath = (char *)malloc(512);
+    synth = (struct lh_arc_entry_ref *)calloc(1, sizeof(*synth));
+    if (!leaf || !dirpath || !synth) {
+        free(leaf);
+        free(dirpath);
+        free(synth);
         return 0;
     }
     arc = lock->archive;
@@ -668,7 +715,7 @@ static int lh_fill_next_child(struct LhLock *lock, struct FileInfoBlock *fib)
     }
     for (i = lock->iterate_index + 1; i < arc->catalog_count; i++) {
         if (!lh_child_leaf_from_entry(parent, arc->catalog[i].name,
-                leaf, (LONG)sizeof(leaf), &is_dir, i, &exact)) {
+                leaf, 108L, &is_dir, i, &exact)) {
             continue;
         }
         if (lh_leaf_seen_before(arc, parent, leaf, i)) {
@@ -689,25 +736,30 @@ static int lh_fill_next_child(struct LhLock *lock, struct FileInfoBlock *fib)
                     lh_fib_apply_dir_date(arc, arc->catalog[exact].name, fib);
                 }
             }
-            return 1;
+            ok = 1;
+            break;
         }
         /* Implied directory (only deeper paths exist). */
-        memset(&synth, 0, sizeof(synth));
-        synth.name = leaf;
-        synth.is_directory = 1;
-        synth.orig = 0;
-        lh_join_dir_path(parent, leaf, dirpath, (LONG)sizeof(dirpath));
-        lh_dir_datetime(arc, dirpath, &synth.dt);
-        lh_ref_to_fib(&synth, fib);
-        return 1;
+        memset(synth, 0, sizeof(*synth));
+        synth->name = leaf;
+        synth->is_directory = 1;
+        synth->orig = 0;
+        lh_join_dir_path(parent, leaf, dirpath, 512L);
+        lh_dir_datetime(arc, dirpath, &synth->dt);
+        lh_ref_to_fib(synth, fib);
+        ok = 1;
+        break;
     }
-    return 0;
+    free(leaf);
+    free(dirpath);
+    free(synth);
+    return ok;
 }
 
 static int lh_read_entry_at_index(struct LhArchive *arc, LONG index,
     unsigned char **out, unsigned long *out_len, int *crc_ok)
 {
-    lh_entry entry;
+    lh_entry *entry;
     lh_status st;
     LONG i;
 
@@ -718,6 +770,10 @@ static int lh_read_entry_at_index(struct LhArchive *arc, LONG index,
         return 0;
     }
     if (arc->catalog[index].is_directory) {
+        return 0;
+    }
+    entry = (lh_entry *)calloc(1, sizeof(*entry));
+    if (!entry) {
         return 0;
     }
     if (arc->has_password) {
@@ -732,42 +788,48 @@ static int lh_read_entry_at_index(struct LhArchive *arc, LONG index,
     if (!arc->has_password) {
         if (!lh_reader_seek(arc->reader,
                 (long)arc->catalog[index].header_off)) {
+            free(entry);
             return 0;
         }
     } else {
         if (!lh_reader_rewind(arc->reader)) {
+            free(entry);
             return 0;
         }
         lh_reader_set_header_only(arc->reader, 1);
         for (i = 0; i < index; i++) {
-            memset(&entry, 0, sizeof(entry));
-            st = lh_reader_next(arc->reader, &entry);
-            if (st != LH_OK || !entry.filename) {
-                lh_entry_clear(&entry);
+            memset(entry, 0, sizeof(*entry));
+            st = lh_reader_next(arc->reader, entry);
+            if (st != LH_OK || !entry->filename) {
+                lh_entry_clear(entry);
+                free(entry);
                 return 0;
             }
-            lh_entry_clear(&entry);
+            lh_entry_clear(entry);
         }
     }
 
     lh_reader_set_header_only(arc->reader, 0);
-    memset(&entry, 0, sizeof(entry));
-    st = lh_reader_next(arc->reader, &entry);
-    if (st != LH_OK || !entry.filename) {
-        lh_entry_clear(&entry);
+    memset(entry, 0, sizeof(*entry));
+    st = lh_reader_next(arc->reader, entry);
+    if (st != LH_OK || !entry->filename) {
+        lh_entry_clear(entry);
+        free(entry);
         return 0;
     }
-    if (entry.is_directory || !entry.data || entry.data_len == 0) {
-        lh_entry_clear(&entry);
+    if (entry->is_directory || !entry->data || entry->data_len == 0) {
+        lh_entry_clear(entry);
+        free(entry);
         return 0;
     }
-    *out = entry.data;
-    *out_len = (unsigned long)entry.data_len;
-    entry.data = NULL;
+    *out = entry->data;
+    *out_len = (unsigned long)entry->data_len;
+    entry->data = NULL;
     if (crc_ok) {
-        *crc_ok = entry.crc_ok;
+        *crc_ok = entry->crc_ok;
     }
-    lh_entry_clear(&entry);
+    lh_entry_clear(entry);
+    free(entry);
     return 1;
 }
 
@@ -976,7 +1038,7 @@ LONG lh_arc_examine(BPTR lock_bptr, struct FileInfoBlock *fib)
 {
     struct LhLock *lock;
     struct LhArchive *arc;
-    struct lh_arc_entry_ref synth;
+    struct lh_arc_entry_ref *synth;
     const char *leaf;
     LONG i;
 
@@ -1010,11 +1072,16 @@ LONG lh_arc_examine(BPTR lock_bptr, struct FileInfoBlock *fib)
                 leaf = &lock->name[i + 1];
             }
         }
-        memset(&synth, 0, sizeof(synth));
-        synth.name = (char *)leaf;
-        synth.is_directory = 1;
-        lh_dir_datetime(arc, lock->name, &synth.dt);
-        lh_ref_to_fib(&synth, fib);
+        synth = (struct lh_arc_entry_ref *)calloc(1, sizeof(*synth));
+        if (!synth) {
+            lh_arc_seterr(ERROR_NO_FREE_STORE);
+            return DOSFALSE;
+        }
+        synth->name = (char *)leaf;
+        synth->is_directory = 1;
+        lh_dir_datetime(arc, lock->name, &synth->dt);
+        lh_ref_to_fib(synth, fib);
+        free(synth);
         lock->iterate_index = -1;
         return DOSTRUE;
     }
@@ -1155,7 +1222,7 @@ LONG lh_arc_exall(BPTR lock_bptr, STRPTR buffer, LONG buf_size, LONG type,
     struct ExAllData *ead;
     struct ExAllData *prev;
     struct lh_arc_entry_ref *ref;
-    struct lh_arc_entry_ref synth;
+    struct lh_arc_entry_ref *synth;
     UBYTE *bp;
     UBYTE *bufend;
     UBYTE *strp;
@@ -1167,11 +1234,17 @@ LONG lh_arc_exall(BPTR lock_bptr, STRPTR buffer, LONG buf_size, LONG type,
     int is_dir;
     const char *parent;
     const char *comment;
-    char leaf[108];
-    char dirpath[512];
+    char *leaf;
+    char *dirpath;
     struct DateStamp ds;
     lh_datetime ds_dt;
     int is_dirlock;
+    LONG result;
+
+    leaf = NULL;
+    dirpath = NULL;
+    synth = NULL;
+    result = DOSFALSE;
 
     if (!lock_bptr || !buffer || buf_size <= 0 || !control) {
         lh_arc_seterr(ERROR_NO_FREE_STORE);
@@ -1213,6 +1286,17 @@ LONG lh_arc_exall(BPTR lock_bptr, STRPTR buffer, LONG buf_size, LONG type,
         return DOSFALSE;
     }
 
+    leaf = (char *)malloc(108);
+    dirpath = (char *)malloc(512);
+    synth = (struct lh_arc_entry_ref *)calloc(1, sizeof(*synth));
+    if (!leaf || !dirpath || !synth) {
+        free(leaf);
+        free(dirpath);
+        free(synth);
+        lh_arc_seterr(ERROR_NO_FREE_STORE);
+        return DOSFALSE;
+    }
+
     if (lock->entry_index == LH_LOCK_ROOT_DIR) {
         parent = "";
     } else {
@@ -1228,7 +1312,7 @@ LONG lh_arc_exall(BPTR lock_bptr, STRPTR buffer, LONG buf_size, LONG type,
 
     while (idx < arc->catalog_count) {
         if (!lh_child_leaf_from_entry(parent, arc->catalog[idx].name,
-                leaf, (LONG)sizeof(leaf), &is_dir, idx, &exact)) {
+                leaf, 108L, &is_dir, idx, &exact)) {
             idx++;
             continue;
         }
@@ -1246,13 +1330,13 @@ LONG lh_arc_exall(BPTR lock_bptr, STRPTR buffer, LONG buf_size, LONG type,
             }
             comment = ref->comment;
         } else {
-            memset(&synth, 0, sizeof(synth));
-            synth.name = leaf;
-            synth.is_directory = 1;
-            synth.orig = 0;
-            lh_join_dir_path(parent, leaf, dirpath, (LONG)sizeof(dirpath));
-            lh_dir_datetime(arc, dirpath, &synth.dt);
-            ref = &synth;
+            memset(synth, 0, sizeof(*synth));
+            synth->name = leaf;
+            synth->is_directory = 1;
+            synth->orig = 0;
+            lh_join_dir_path(parent, leaf, dirpath, 512L);
+            lh_dir_datetime(arc, dirpath, &synth->dt);
+            ref = synth;
             is_dir = 1;
         }
 
@@ -1262,7 +1346,8 @@ LONG lh_arc_exall(BPTR lock_bptr, STRPTR buffer, LONG buf_size, LONG type,
                 lh_arc_seterr(ERROR_LINE_TOO_LONG);
                 control->eac_Entries = 0;
                 control->eac_LastKey = (ULONG)idx;
-                return DOSFALSE;
+                result = DOSFALSE;
+                goto done;
             }
             break;
         }
@@ -1282,7 +1367,7 @@ LONG lh_arc_exall(BPTR lock_bptr, STRPTR buffer, LONG buf_size, LONG type,
         }
         if (type >= ED_DATE) {
             if (is_dir && lh_datetime_unset(&ref->dt)) {
-                lh_join_dir_path(parent, leaf, dirpath, (LONG)sizeof(dirpath));
+                lh_join_dir_path(parent, leaf, dirpath, 512L);
                 lh_dir_datetime(arc, exact >= 0 ? ref->name : dirpath, &ds_dt);
                 lh_dt_to_datestamp(&ds_dt, &ds);
             } else {
@@ -1326,9 +1411,16 @@ LONG lh_arc_exall(BPTR lock_bptr, STRPTR buffer, LONG buf_size, LONG type,
     control->eac_LastKey = (ULONG)idx;
     if (idx >= arc->catalog_count) {
         lh_arc_seterr(ERROR_NO_MORE_ENTRIES);
-        return DOSFALSE;
+        result = DOSFALSE;
+    } else {
+        result = DOSTRUE;
     }
-    return DOSTRUE;
+
+done:
+    free(leaf);
+    free(dirpath);
+    free(synth);
+    return result;
 }
 
 LONG lh_arc_exall_end(BPTR lock_bptr)
@@ -1453,21 +1545,28 @@ BPTR lh_arc_open_from_lock(BPTR lock_bptr, LONG mode)
 
 static int lh_arc_mkdir_chain(STRPTR dirpath)
 {
-    char buf[512];
+    char *buf;
     char *p;
     BPTR lock;
+    int ok;
 
     if (!dirpath || !dirpath[0]) {
         return 1;
     }
-    strncpy(buf, (const char *)dirpath, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    buf = (char *)malloc(512);
+    if (!buf) {
+        return 0;
+    }
+    strncpy(buf, (const char *)dirpath, 511);
+    buf[511] = '\0';
+    ok = 1;
     for (p = buf + 1; *p; p++) {
         if (*p == '/' || *p == '\\') {
             *p = '\0';
             lock = CreateDir((STRPTR)buf);
             if (lock == (BPTR)NULL && IoErr() != ERROR_OBJECT_EXISTS) {
-                return 0;
+                ok = 0;
+                break;
             }
             if (lock != (BPTR)NULL) {
                 UnLock(lock);
@@ -1475,33 +1574,42 @@ static int lh_arc_mkdir_chain(STRPTR dirpath)
             *p = '/';
         }
     }
-    lock = CreateDir((STRPTR)buf);
-    if (lock == (BPTR)NULL && IoErr() != ERROR_OBJECT_EXISTS) {
-        return 0;
+    if (ok) {
+        lock = CreateDir((STRPTR)buf);
+        if (lock == (BPTR)NULL && IoErr() != ERROR_OBJECT_EXISTS) {
+            ok = 0;
+        } else if (lock != (BPTR)NULL) {
+            UnLock(lock);
+        }
     }
-    if (lock != (BPTR)NULL) {
-        UnLock(lock);
-    }
-    return 1;
+    free(buf);
+    return ok;
 }
 
 static int lh_arc_ensure_parent(STRPTR path)
 {
-    char buf[512];
+    char *buf;
     STRPTR pp;
     STRPTR p;
+    int ok;
 
     if (!path || !path[0]) {
         return 0;
     }
-    strncpy(buf, (const char *)path, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    buf = (char *)malloc(512);
+    if (!buf) {
+        return 0;
+    }
+    strncpy(buf, (const char *)path, 511);
+    buf[511] = '\0';
     pp = PathPart((STRPTR)buf);
     if (!pp || pp == (STRPTR)buf) {
+        free(buf);
         return 1;
     }
     *pp = '\0';
     if (buf[0] == '\0') {
+        free(buf);
         return 1;
     }
     p = (STRPTR)buf;
@@ -1509,9 +1617,12 @@ static int lh_arc_ensure_parent(STRPTR path)
         p++;
     }
     if (p > (STRPTR)buf && *(p - 1) == ':') {
+        free(buf);
         return 1;
     }
-    return lh_arc_mkdir_chain((STRPTR)buf);
+    ok = lh_arc_mkdir_chain((STRPTR)buf);
+    free(buf);
+    return ok;
 }
 
 /*
@@ -1803,8 +1914,9 @@ LONG lh_arc_add_entry(struct LhArchive *archive, STRPTR name, APTR data, LONG le
  *   LHADD_Method     - lh_level (0=store, 5=lh5, 11=dir)
  *   LHADD_Attrs      - Amiga protection bits -> LHA attribute byte
  *   LHADD_DateStamp  - struct DateStamp *
- *   LHADD_Comment    - STRPTR filenote -> extension 0x41
+ *   LHADD_Comment    - STRPTR filenote -> extension 0x3F (+ UTF-16 0x46)
  *   LHADD_Directory  - nonzero -> -lhd- directory (ignores data)
+ *   LHADD_Snapshot - struct LhSnapshot * -> extension 0x47
  */
 LONG lh_arc_add_entry_taglist(
     struct LhArchive *archive,
@@ -1821,7 +1933,11 @@ LONG lh_arc_add_entry_taglist(
     struct TagItem *t;
     struct DateStamp *ds;
     int as_dir;
+    const struct LhSnapshot *asn;
+    lh_snapshot *sn;
+    const lh_snapshot *sn_ptr;
 
+    sn = NULL;
     if (!archive || !archive->writer || !name) {
         lh_arc_seterr(ERROR_INVALID_COMPONENT_NAME);
         return DOSFALSE;
@@ -1836,6 +1952,8 @@ LONG lh_arc_add_entry_taglist(
     attrs = LH_ATTR_DEFAULT;
     comment = NULL;
     as_dir = 0;
+    asn = NULL;
+    sn_ptr = NULL;
     lh_datetime_now(&dt);
 
     if (tags) {
@@ -1858,6 +1976,8 @@ LONG lh_arc_add_entry_taglist(
                 if (t->ti_Data) {
                     as_dir = 1;
                 }
+            } else if (t->ti_Tag == LHADD_Snapshot) {
+                asn = (const struct LhSnapshot *)t->ti_Data;
             }
         }
     }
@@ -1866,10 +1986,29 @@ LONG lh_arc_add_entry_taglist(
         data = NULL;
         len = 0;
     }
+    if (asn) {
+        /*
+         * LhSnapshot and lh_snapshot are layout-compatible on Amiga
+         * (ULONG == unsigned long).  CopyMem avoids SAS/C field-copy
+         * quirks on the large trailing ver[] member.
+         */
+        sn = (lh_snapshot *)malloc(sizeof(*sn));
+        if (!sn) {
+            lh_arc_seterr(ERROR_NO_FREE_STORE);
+            return DOSFALSE;
+        }
+        CopyMem((APTR)asn, (APTR)sn, (ULONG)sizeof(*sn));
+        if (sn->format == 0) {
+            sn->format = (unsigned char)LH_SNAP_FORMAT_V1;
+        }
+        sn->ver[LH_SNAP_VER_MAX] = '\0';
+        sn_ptr = sn;
+    }
 
     st = lh_writer_add(archive->writer, (const char *)name, comment,
         attrs, &dt, level, 0,
-        (const unsigned char *)data, (size_t)len);
+        (const unsigned char *)data, (size_t)len, sn_ptr);
+    free(sn);
     if (st != LH_OK) {
         if (st == LH_ERR_NO_MEMORY) {
             lh_arc_seterr(ERROR_NO_FREE_STORE);
@@ -1880,6 +2019,40 @@ LONG lh_arc_add_entry_taglist(
         }
         return DOSFALSE;
     }
+    lh_arc_clearerr();
+    SetIoErr(0);
+    return DOSTRUE;
+}
+
+LONG lh_arc_get_snapshot(
+    struct LhArchive *arc,
+    STRPTR name,
+    struct LhSnapshot *out)
+{
+    LONG idx;
+
+    if (!arc || !name || !name[0] || !out) {
+        lh_arc_seterr(ERROR_INVALID_COMPONENT_NAME);
+        return DOSFALSE;
+    }
+    memset(out, 0, sizeof(*out));
+
+    /* Exact name only — lh_name_match treats "" / "*" as wildcards. */
+    idx = lh_find_entry_index(arc, (const char *)name);
+    if (idx < 0) {
+        lh_arc_seterr(ERROR_OBJECT_NOT_FOUND);
+        return DOSFALSE;
+    }
+    if (!arc->catalog[idx].have_snapshot
+            || arc->catalog[idx].snapshot.format
+                != (unsigned char)LH_SNAP_FORMAT_V1) {
+        lh_arc_seterr(ERROR_OBJECT_NOT_FOUND);
+        return DOSFALSE;
+    }
+
+    CopyMem((APTR)&arc->catalog[idx].snapshot, (APTR)out,
+        (ULONG)sizeof(*out));
+    out->lsn_Ver[LH_SNAP_VER_MAX] = '\0';
     lh_arc_clearerr();
     SetIoErr(0);
     return DOSTRUE;
@@ -1900,20 +2073,32 @@ LONG lh_arc_delete_entry(struct LhArchive *archive, STRPTR name)
 {
     lh_status st;
     int had_reader;
+    int had_writer;
 
     if (!archive || !name) {
         lh_arc_seterr(ERROR_INVALID_COMPONENT_NAME);
         return DOSFALSE;
     }
     had_reader = (archive->reader != NULL) ? 1 : 0;
+    had_writer = (archive->writer != NULL) ? 1 : 0;
     if (had_reader) {
         lh_reader_close(&archive->reader);
+    }
+    /*
+     * Rewrite replaces the on-disk file.  An open writer holds that path
+     * and must be closed first or Open/Delete deadlocks / corrupts.
+     */
+    if (had_writer) {
+        lh_writer_close(&archive->writer);
     }
     /* On-disk rewrite invalidates any memory image of the old file. */
     lh_arc_drop_file_mem(archive);
     st = lh_archive_rewrite(archive->path, lh_keep_not_name, (void *)name,
         2, LH_LEVEL_STORE, 1);
     if (st != LH_OK) {
+        if (had_writer) {
+            archive->writer = lh_writer_open_append(archive->path, &st);
+        }
         if (had_reader) {
             archive->reader = lh_reader_open(archive->path, &st);
             if (archive->reader) {
@@ -1929,6 +2114,14 @@ LONG lh_arc_delete_entry(struct LhArchive *archive, STRPTR name)
             lh_arc_seterr(ERROR_WRITE_PROTECTED);
         }
         return DOSFALSE;
+    }
+    if (had_writer) {
+        st = LH_OK;
+        archive->writer = lh_writer_open_append(archive->path, &st);
+        if (!archive->writer) {
+            lh_arc_seterr(IoErr() != 0 ? IoErr() : ERROR_OBJECT_IN_USE);
+            return DOSFALSE;
+        }
     }
     if (had_reader) {
         st = LH_OK;

@@ -25,7 +25,8 @@ SHELL_OBJS = StartUp.o LibInit.o malloc.o lh_lvo.o lh_archive_dos.o lh_amiga_tim
 
 CORE_OBJS = \
     lh_error.o lh_crc.o lh_crypto.o lh_datetime.o \
-    lh_codec.o lh_lh5dec.o lh_lh1dec.o lh_header.o lh_archive.o lh_buffer.o lh_lzhuf.o
+    lh_codec.o lh_lh5dec.o lh_lh1dec.o lh_charset.o lh_header.o lh_archive.o \
+    lh_buffer.o lh_lzhuf.o
 
 LIB_OBJS = $(SHELL_OBJS) $(CORE_OBJS)
 
@@ -82,6 +83,9 @@ lh_lh5dec.o: /src/lh_lh5dec.c
 lh_lh1dec.o: /src/lh_lh1dec.c
 	$(CC) $(LHINCL) /src/lh_lh1dec.c OBJNAME=lh_lh1dec.o
 
+lh_charset.o: /src/lh_charset.c
+	$(CC) $(LHINCL) /src/lh_charset.c OBJNAME=lh_charset.o
+
 lh_header.o: /src/lh_header.c
 	$(CC) $(LHINCL) /src/lh_header.c OBJNAME=lh_header.o
 
@@ -113,7 +117,7 @@ clean:
 	$(RM) $(LIB_OBJS) $(STATIC_OBJS) $(TARGET) $(STATIC)
 
 install: all
-	copy $(TARGET) SDK:Libs/$(TARGET)
+	copy $(TARGET) LIBS:$(TARGET)
 
 # Canonical client headers: //SDK/Include_h (not Source/include, which is engine-only).
 headers:

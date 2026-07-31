@@ -71,6 +71,7 @@ LONG LhExtractEntry(struct LhArchive *Archive, STRPTR Name, STRPTR DestPath);
 LONG LhTestEntry(struct LhArchive *Archive, STRPTR Name);
 LONG LhPrintEntry(struct LhArchive *Archive, STRPTR Name);
 LONG LhErr(void);
+LONG LhGetSnapshot(struct LhArchive *Archive, STRPTR Name, struct LhSnapshot *Out);
 
 #ifdef __cplusplus
 }

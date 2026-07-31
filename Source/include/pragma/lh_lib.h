@@ -54,5 +54,6 @@
 #pragma amicall(LhBase, 0xC6, LhTestEntry(a0,a1))
 #pragma amicall(LhBase, 0xCC, LhPrintEntry(a0,a1))
 #pragma amicall(LhBase, 0xD2, LhErr())
+#pragma amicall(LhBase, 0xD8, LhGetSnapshot(a0,a1,a2))
 
 #endif /* PRAGMA_LH_LIB_H */

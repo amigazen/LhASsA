@@ -66,17 +66,50 @@ typedef unsigned long lh_u32;
 
 #define LH_OS_AMIGA 'A'
 #define LH_OS_MSDOS 'M'
+#define LH_OS_WIN95 '9'  /* Windows 95/NT OS ID (OEM heuristic) */
 
 /* LHA header extension types (level 1/2). */
-#define LH_EXT_COMMON    0x00  /* header CRC-16 (required for level 2) */
-#define LH_EXT_FILENAME  1
-#define LH_EXT_PATH      2
-#define LH_EXT_COMMENT   0x41
+#define LH_EXT_COMMON         0x00  /* header CRC-16 (required for level 2) */
+#define LH_EXT_FILENAME       1
+#define LH_EXT_PATH           2
+#define LH_EXT_COMMENT        0x3F  /* legacy OEM/Latin-1 comment */
+#define LH_EXT_WIN_FILETIME   0x41  /* Windows FILETIME; skip on read */
+#define LH_EXT_UTF16_FILENAME 0x44  /* Unlha32 UTF-16LE filename */
+#define LH_EXT_UTF16_PATH     0x45  /* Unlha32 UTF-16LE directory */
+#define LH_EXT_UTF16_COMMENT  0x46  /* Unlha32 UTF-16LE comment */
+#define LH_EXT_SNAPSHOT       0x47  /* Snapshot member meta (magic LHSS) */
 /* Path components in type-2 extensions are separated by 0xFF. */
 #define LH_PATH_SEP      ((char)0xFF)
+/* UTF-16LE path separator used in Unlha32 type-0x45 payloads. */
+#define LH_UTF16_PATH_SEP 0xFFFFu
 
 /* Convert LHA/MS-DOS separators in a path to Amiga '/' in place. */
 void lh_normalize_path_seps(char *path);
+
+/*
+ * Charset helpers (library-private).  Catalog / Amiga FS use ISO-8859-1.
+ * See lha-utf.md / Unlha32 0x44/0x45/0x46.
+ */
+lh_status lh_utf16le_to_latin1(
+    const unsigned char *src,
+    size_t src_len,
+    char **out_str);
+lh_status lh_utf16le_to_latin1_buf(
+    const unsigned char *src,
+    size_t src_len,
+    char *dst,
+    size_t dst_size,
+    size_t *out_len);
+lh_status lh_latin1_to_utf16le(
+    const char *src,
+    unsigned char **out_bytes,
+    size_t *out_len);
+lh_status lh_latin1_path_to_utf16le(
+    const unsigned char *src,
+    size_t src_len,
+    unsigned char **out_bytes,
+    size_t *out_len);
+void lh_oem_to_latin1_inplace(unsigned char os_id, char *s);
 
 #define LH_BUF_DECODE_AUX 4500u
 #define LH_BUF_ENCODE_AUX 40000u
@@ -223,7 +256,24 @@ typedef struct lh_hdr_meta {
     int is_directory;
     char *filename;
     char *comment;
+    /* Set when Unlha32 UTF-16LE name/dir/comment extensions were used. */
+    int have_utf16_name;
+    int have_utf16_dir;
+    int have_utf16_comment;
+    /* Snapshot ext 0x47 (present when have_snapshot != 0). */
+    int have_snapshot;
+    lh_snapshot snapshot;
 } lh_hdr_meta;
+
+/* Pack/unpack snapshot ext 0x47 payload (library-private). */
+lh_status lh_snapshot_pack(
+    const lh_snapshot *cp,
+    unsigned char **out_bytes,
+    size_t *out_len);
+lh_status lh_snapshot_unpack(
+    const unsigned char *src,
+    size_t src_len,
+    lh_snapshot *cp);
 
 void lh_hdr_meta_clear(lh_hdr_meta *m);
 

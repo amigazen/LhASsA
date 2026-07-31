@@ -35,6 +35,7 @@ lh.library/LhExtractEntry
 lh.library/LhTestEntry
 lh.library/LhPrintEntry
 lh.library/LhErr
+lh.library/LhGetSnapshot
 lh.library/background                                 lh.library/background
 
    PURPOSE
@@ -179,7 +180,9 @@ lh.library/LhErr
    LHADD_Method     (TAG_USER+1) -- compression level (0=store, 5=lh5, ...)
    LHADD_Attrs      (TAG_USER+2) -- Amiga protection bits
    LHADD_DateStamp  (TAG_USER+3) -- struct DateStamp *
-   LHADD_Comment    (TAG_USER+4) -- STRPTR filenote (ext 0x41)
+   LHADD_Comment    (TAG_USER+4) -- STRPTR filenote (ext 0x3F + UTF-16 0x46)
+   LHADD_Directory  (TAG_USER+5) -- nonzero -> -lhd- directory member
+   LHADD_Snapshot (TAG_USER+6) -- struct LhSnapshot * (ext 0x47 LHSS)
 
    BUFFER (struct LhBuffer)
 
@@ -1050,8 +1053,9 @@ lh.library/LhErr
 
        Nested names (e.g. LIBS/foo.library) are written as header level 2
        with filename extension type 1 and path extension type 2 (0xFF
-       separators).  Comments are stored as extension type 0x41 and
-       restored as filenotes on LhExtractEntry / LhExamine.
+       separators).  Comments are stored as extension type 0x3F (legacy)
+       plus Unlha32 UTF-16LE type 0x46, and are restored as filenotes on
+       LhExtractEntry / LhExamine.
 
    INPUTS
        Archive - archive opened for write or append.
@@ -1060,10 +1064,12 @@ lh.library/LhErr
        DataLen - payload length in bytes.
        TagList - optional TagItem list ending in TAG_DONE, or NULL.
 
-       LHADD_Method    (TAG_USER+1)  compression level (0=store, 5=lh5, ...)
-       LHADD_Attrs     (TAG_USER+2)  Amiga protection bits → LHA attribute
-       LHADD_DateStamp (TAG_USER+3)  struct DateStamp *
-       LHADD_Comment   (TAG_USER+4)  STRPTR filenote
+       LHADD_Method     (TAG_USER+1)  compression level (0=store, 5=lh5, ...)
+       LHADD_Attrs      (TAG_USER+2)  Amiga protection bits → LHA attribute
+       LHADD_DateStamp  (TAG_USER+3)  struct DateStamp *
+       LHADD_Comment    (TAG_USER+4)  STRPTR filenote
+       LHADD_Directory  (TAG_USER+5)  nonzero → -lhd- directory member
+       LHADD_Snapshot (TAG_USER+6)  struct LhSnapshot * → ext 0x47
 
    RESULT
        success - DOSTRUE on success, DOSFALSE on failure (see LhErr()).
@@ -1090,12 +1096,16 @@ lh.library/LhErr
 
    NOTES
        LhAddEntry() is the ==varargs alias for this LVO.
+       LHADD_Snapshot stores per-member snapshot index metadata as LHA
+       extended header type 0x47 (magic "LHSS").  Requires a level-2
+       header chain (Amiga write mode already uses level 2).  Read back
+       with LhGetSnapshot().
 
    BUGS
 
    SEE ALSO
        LhAddEntry(), LhOpenArchive(), LhDeleteFile(), LhConcatArchive(),
-       LhExtractEntry(), lh.library/constants
+       LhExtractEntry(), LhGetSnapshot(), lh.library/constants
 lh.library/LhAddEntry                                 lh.library/LhAddEntry
 
    NAME
@@ -1287,7 +1297,7 @@ lh.library/LhErr
        Decompresses Name and writes it to DestPath.  Parent directories
        are created as needed.  After writing, applies catalog metadata:
        SetProtection (LHA attribute byte), SetFileDate, and SetComment
-       (extension 0x41 filenote) when present.
+       (extension 0x3F / 0x46 filenote) when present.
 
    INPUTS
        Archive  - archive opened for read.
@@ -1413,3 +1423,47 @@ lh.library/LhErr
 
    SEE ALSO
        lh.library/errors, dos.library/IoErr
+lh.library/LhGetSnapshot                         lh.library/LhGetSnapshot
+
+   NAME
+       LhGetSnapshot -- Read snapshot metadata for a named entry  (V2)
+
+   SYNOPSIS
+       success = LhGetSnapshot(Archive, Name, Out);
+       D0                        A0       A1    A2
+
+       LONG LhGetSnapshot(struct LhArchive *Archive, STRPTR Name,
+           struct LhSnapshot *Out);
+
+   FUNCTION
+       Copies the snapshot index (LHA extended header 0x47, magic
+       "LHSS") for Name into Out.  Entries without a 0x47 extension fail
+       with ERROR_OBJECT_NOT_FOUND (same as a missing member).
+
+       Out receives generation, recorded size, flags, format, snap id
+       (16 bytes), SHA-256 (32 bytes), and optional $VER string.  See
+       struct LhSnapshot in <libraries/lh.h>.
+
+   INPUTS
+       Archive - archive opened for read (catalog must be loaded).
+       Name    - entry path within the archive.
+       Out     - destination; must not be NULL.
+
+   RESULT
+       success - DOSTRUE on success, DOSFALSE on failure (see LhErr()).
+
+   EXAMPLE
+
+       struct LhSnapshot sn;
+
+       if (LhGetSnapshot(arc, "C/CheckSys", &sn)) {
+           Printf("gen %ld size %ld\n", sn.lsn_Generation, sn.lsn_Size);
+       }
+
+   NOTES
+       Written with LhAddEntryA(..., LHADD_Snapshot, &sn, TAG_DONE).
+
+   BUGS
+
+   SEE ALSO
+       LhAddEntryA(), LhOpenArchive(), lh.library/constants

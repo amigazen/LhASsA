@@ -336,5 +336,16 @@
 	r;   \
 })
 
+#define LhGetSnapshot(Archive, Name, Out)    \
+({  \
+	register void *b __asm("a6") = LhBase;  \
+	register struct LhArchive *p0 __asm("a0") = (Archive);   \
+	register STRPTR p1 __asm("a1") = (Name);   \
+	register struct LhSnapshot *p2 __asm("a2") = (Out);   \
+	register APTR r __asm("d0");   \
+	__asm volatile ("jsr a6@(-216:W);" : "+r"(b), "=r"(r) : "r"(p0), "r"(p1), "r"(p2) : "d0", "d1", "a0", "a1", "fp0", "fp1", "cc", "memory");    \
+	r;   \
+})
+
 
 #endif /* INLINE_LH_H */

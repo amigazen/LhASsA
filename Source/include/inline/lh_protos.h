@@ -114,5 +114,8 @@ LONG __LhPrintEntry(__reg("a6") void *, __reg("a0") struct LhArchive *Archive, _
 LONG __LhErr(__reg("a6") void *)="\tjsr\t-210(a6)";
 #define LhErr() __LhErr(LhBase)
 
+LONG __LhGetSnapshot(__reg("a6") void *, __reg("a0") struct LhArchive *Archive, __reg("a1") STRPTR Name, __reg("a2") struct LhSnapshot *Out)="\tjsr\t-216(a6)";
+#define LhGetSnapshot(Archive, Name, Out) __LhGetSnapshot(LhBase, (Archive), (Name), (Out))
+
 
 #endif /* INLINE_LH_PROTOS_H */

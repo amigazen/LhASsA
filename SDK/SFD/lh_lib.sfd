@@ -52,4 +52,5 @@ LONG LhExtractEntry (struct LhArchive *Archive, STRPTR Name, STRPTR DestPath)(A0
 LONG LhTestEntry (struct LhArchive *Archive, STRPTR Name)(A0,A1)
 LONG LhPrintEntry (struct LhArchive *Archive, STRPTR Name)(A0,A1)
 LONG LhErr ()()
+LONG LhGetSnapshot (struct LhArchive *Archive, STRPTR Name, struct LhSnapshot *Out)(A0,A1,A2)
 ==end

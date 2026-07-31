@@ -101,6 +101,7 @@ APTR FuncTab[] = {
     (APTR)LhTestEntry,
     (APTR)LhPrintEntry,
     (APTR)LhErr,
+    (APTR)LhGetSnapshot,
     (APTR)((LONG)-1)
 };
 

@@ -5,23 +5,35 @@
  *
  * LhTest.c - Standalone lh.library smoke / regression harness.
  *
- * Exercises every public LVO from SDK/SFD/lh_lib.sfd (31 functions):
+ * Exercises every public LVO from SDK/SFD/lh_lib.sfd (32 functions):
  *
  *   CreateBuffer, DeleteBuffer, LhEncode, LhDecode, LhCompress, LhDecompress,
  *   LhOpenArchive, LhCloseArchive, LhLock, LhUnLock, LhExamine, LhExNext,
  *   LhExAll, LhExAllEnd, LhInfo, LhOpenFromLock, LhOpen, LhRead, LhWrite,
  *   LhClose, LhSeek, LhNameFromLock, LhAddEntryA,
  *   LhDeleteFile, LhConcatArchive, LhSetPassword, LhReadData, LhExtractEntry,
- *   LhTestEntry, LhPrintEntry, LhErr.
+ *   LhTestEntry, LhPrintEntry, LhErr, LhGetSnapshot.
  *   (LhAddEntry is the ==varargs alias of LhAddEntryA, same LVO.)
  *
  * Fixture entries are added with LH0 via LhAddEntryA so payload round-trips
  * stay deterministic.  Add coverage includes multi-KB in-memory LhAddEntryA
  * and an LhX-style on-disk file with SetProtection/SetComment, TagList add,
  * extract, and Examine of the restored protection bits and filenote.
+ * Also covers LHADD_Snapshot / LhGetSnapshot and Latin-1 comment dual-emit
+ * (legacy 0x3F + UTF-16 0x46) with nested level-2 paths.
  *
- * Flow: classic buffer -> add round-trips -> create fixture -> read APIs
- * -> mutate -> verify.
+ * Regressions (CheckPoint / lh5 writer fixes):
+ *   - LHADD_Method lh5 add must not fail with LhErr 223; library may
+ *     fall back to lh0 when compress fails or expands
+ *   - All-identical / Prefs-sized payloads must finish (lh5 EOF hang)
+ *   - Larger patterned payloads must finish (no lh5 hash-chain hang)
+ *   - Many sequential lh5+snapshot adds (CheckSys Prefs.lha shape)
+ *   - LhDeleteFile while archive is open for write/append must not
+ *     deadlock; subsequent adds and close must succeed
+ *   - lh5 + LHADD_Snapshot together (CheckPoint SET path)
+ *
+ * Flow: classic buffer -> add round-trips -> snapshot/charset -> lh5/delete
+ * regressions -> create fixture -> read APIs -> mutate -> verify.
  *
  *   LhTest >RAM:LhTest.out
  *   LhTest LhA-mos.lha
@@ -53,6 +65,24 @@
 #define LT_ADD_OUT      "RAM:LhTest/Out/LtAddSrc.bin"
 #define LT_ADD_SIZE     4096L
 #define LT_ADD_COMMENT  "LhTest Amiga filenote"
+#define LT_SNAP_ARC     "RAM:LhTest/LhSnap.lha"
+#define LT_SNAP_ENTRY   "Libs/CheckPt.bin"
+#define LT_CHAR_ARC     "RAM:LhTest/LhChar.lha"
+#define LT_CHAR_ENTRY   "S/note.txt"
+/* Latin-1 filenote: "caf" + e-acute (0xE9); dual-emitted as 0x3F + UTF-16 0x46. */
+#define LT_CHAR_COMMENT "caf\xE9 filenote"
+#define LT_REG_ARC      "RAM:LhTest/LhReg.lha"
+#define LT_REG_LH5_ENT  "reg/lh5.bin"
+#define LT_REG_STRESS   "reg/stress.bin"
+#define LT_REG_SNAP     "Libs/RegSnap.bin"
+#define LT_REG_DEL_A    "keep/a.txt"
+#define LT_REG_DEL_B    "keep/b.txt"
+#define LT_REG_DEL_C    "keep/c.txt"
+/* Large enough to exercise lh5 ring/hash; heap, not stack. */
+#define LT_REG_STRESS_SZ 8192L
+/* CheckSys Prefs.lha: many small repetitive members in one APPEND session. */
+#define LT_REG_MANY_N   48L
+#define LT_REG_MANY_SZ  128L
 /*
  * Distinctive Amiga protection for round-trip checks.  LHA stores one
  * attribute byte; script/pure/archive are high-active, rwed are low-active.
@@ -60,6 +90,7 @@
  */
 #define LT_ADD_PROT     ((LONG)(FIBF_SCRIPT | FIBF_PURE | FIBF_ARCHIVE | FIBF_EXECUTE))
 #define LT_METHOD_LH0   0L
+#define LT_METHOD_LH5   5L
 #define LT_ENTRY_A      "LtReadme.txt"
 #define LT_ENTRY_B      "lhtest.bin"
 #define LT_ENTRY_C      "LtExtra.txt"
@@ -115,8 +146,10 @@ lt_end(BOOL ok, STRPTR actual)
 static VOID
 lt_print_api_plan(VOID)
 {
-    Printf("LhTest: plan - all 31 public LVOs from SDK/SFD/lh_lib.sfd\n");
+    Printf("LhTest: plan - all 32 public LVOs from SDK/SFD/lh_lib.sfd\n");
     Printf("LhTest:   (+ LhAddEntry varargs alias of LhAddEntryA)\n");
+    Printf("LhTest:   (+ Snapshot / Latin-1 comment charset paths)\n");
+    Printf("LhTest:   (+ lh5 EOF/identical, many-add, delete-while-write)\n");
     Flush(Output());
 }
 
@@ -667,7 +700,7 @@ lt_test_addentry_default(VOID)
         return;
     }
 
-    /* Size via Seek the Amiga way (same as Assemble / fixed LhX). */
+    /* Size via Seek the Amiga way (same as Handle / fixed LhX). */
     fh = Open((STRPTR)LT_ADD_SRC, MODE_OLDFILE);
     if (fh == (BPTR)NULL) {
         FreeMem(disk_data, (ULONG)LT_ADD_SIZE);
@@ -834,6 +867,959 @@ lt_test_addentry_default(VOID)
         return;
     }
     lt_end(TRUE, (STRPTR)"prot+comment match");
+}
+
+/*
+ * Snapshot ext 0x47: LHADD_Snapshot on write, LhGetSnapshot on read.
+ */
+static VOID
+lt_test_snapshot(VOID)
+{
+    struct LhArchive *arc;
+    struct LhSnapshot *sn;
+    struct LhSnapshot *got;
+    struct TagItem tags[4];
+    static UBYTE payload[] = "snapshot-payload";
+    LONG i;
+    char detail[64];
+
+    sn = NULL;
+    got = NULL;
+    arc = NULL;
+
+    lt_begin((STRPTR)"LhGetSnapshot",
+        (STRPTR)"round-trip LHADD_Snapshot fields");
+    if (!lt_ensure_dir((STRPTR)LT_RAMDIR)) {
+        lt_end(FALSE, (STRPTR)"mkdir failed");
+        return;
+    }
+    lt_remove_path((STRPTR)LT_SNAP_ARC);
+
+    /* LhSnapshot is ~250 bytes; keep off the Amiga stack. */
+    sn = (struct LhSnapshot *)AllocMem((ULONG)sizeof(*sn),
+        MEMF_PUBLIC | MEMF_CLEAR);
+    got = (struct LhSnapshot *)AllocMem((ULONG)sizeof(*got),
+        MEMF_PUBLIC | MEMF_CLEAR);
+    if (sn == NULL || got == NULL) {
+        if (sn != NULL) {
+            FreeMem(sn, (ULONG)sizeof(*sn));
+        }
+        if (got != NULL) {
+            FreeMem(got, (ULONG)sizeof(*got));
+        }
+        lt_end(FALSE, (STRPTR)"AllocMem snapshot failed");
+        return;
+    }
+
+    sn->lsn_Generation = 3UL;
+    sn->lsn_Size = (ULONG)(sizeof(payload) - 1);
+    sn->lsn_Flags = 0;
+    sn->lsn_Format = LH_SNAP_FORMAT_V1;
+    for (i = 0; i < LH_SNAP_ID_LEN; i++) {
+        sn->lsn_SnapId[i] = (UBYTE)(0x10 + i);
+    }
+    for (i = 0; i < LH_SNAP_SHA256_LEN; i++) {
+        sn->lsn_SHA256[i] = (UBYTE)(0xA0 + (i & 0x0f));
+    }
+    strcpy(sn->lsn_Ver, "$VER: LhTest 1.0");
+
+    tags[0].ti_Tag = LHADD_Method;
+    tags[0].ti_Data = (ULONG)LT_METHOD_LH0;
+    tags[1].ti_Tag = LHADD_Snapshot;
+    tags[1].ti_Data = (ULONG)sn;
+    tags[2].ti_Tag = TAG_DONE;
+
+    arc = LhOpenArchive((STRPTR)LT_SNAP_ARC, LHARC_MODE_WRITE);
+    if (arc == NULL) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!LhAddEntryA(arc, (STRPTR)LT_SNAP_ENTRY, payload,
+            (LONG)(sizeof(payload) - 1), tags)) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        LhCloseArchive(arc);
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    /* Plain member without Snapshot — negative path below. */
+    if (!lt_add_store(arc, (STRPTR)"plain.txt", (APTR)"x", 1L)) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        LhCloseArchive(arc);
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!LhCloseArchive(arc)) {
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)"close failed");
+        return;
+    }
+    arc = NULL;
+
+    arc = LhOpenArchive((STRPTR)LT_SNAP_ARC, LHARC_MODE_READ);
+    if (arc == NULL) {
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)"reopen failed");
+        return;
+    }
+    memset(got, 0, sizeof(*got));
+    if (!LhGetSnapshot(arc, (STRPTR)LT_SNAP_ENTRY, got)) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        LhCloseArchive(arc);
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (got->lsn_Generation != 3UL
+            || got->lsn_Size != (ULONG)(sizeof(payload) - 1)
+            || got->lsn_Format != LH_SNAP_FORMAT_V1
+            || strcmp(got->lsn_Ver, "$VER: LhTest 1.0") != 0) {
+        sprintf(detail, "gen=%lu size=%lu ver='%s'",
+            (unsigned long)got->lsn_Generation,
+            (unsigned long)got->lsn_Size, got->lsn_Ver);
+        LhCloseArchive(arc);
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    for (i = 0; i < LH_SNAP_ID_LEN; i++) {
+        if (got->lsn_SnapId[i] != (UBYTE)(0x10 + i)) {
+            LhCloseArchive(arc);
+            FreeMem(sn, (ULONG)sizeof(*sn));
+            FreeMem(got, (ULONG)sizeof(*got));
+            lt_end(FALSE, (STRPTR)"snap_id mismatch");
+            return;
+        }
+    }
+    for (i = 0; i < LH_SNAP_SHA256_LEN; i++) {
+        if (got->lsn_SHA256[i] != (UBYTE)(0xA0 + (i & 0x0f))) {
+            LhCloseArchive(arc);
+            FreeMem(sn, (ULONG)sizeof(*sn));
+            FreeMem(got, (ULONG)sizeof(*got));
+            lt_end(FALSE, (STRPTR)"sha256 mismatch");
+            return;
+        }
+    }
+    /* Entry present but no 0x47 extension. */
+    if (LhGetSnapshot(arc, (STRPTR)"plain.txt", got)) {
+        LhCloseArchive(arc);
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)"plain.txt unexpectedly has snapshot");
+        return;
+    }
+    /* Missing member. */
+    if (LhGetSnapshot(arc, (STRPTR)"nosuch", got)) {
+        LhCloseArchive(arc);
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)"nosuch unexpectedly ok");
+        return;
+    }
+    LhCloseArchive(arc);
+    FreeMem(sn, (ULONG)sizeof(*sn));
+    FreeMem(got, (ULONG)sizeof(*got));
+    lt_end(TRUE, (STRPTR)"snapshot fields + negatives");
+}
+
+/*
+ * Nested level-2 path + Latin-1 filenote (dual-emitted 0x3F / UTF-16 0x46).
+ */
+static VOID
+lt_test_charset_comment(VOID)
+{
+    struct LhArchive *arc;
+    struct TagItem tags[4];
+    static UBYTE payload[] = "charset-body";
+    char out_path[80];
+    char out_comment[80];
+    LONG out_prot;
+    char detail[64];
+
+    lt_begin((STRPTR)"charset comment",
+        (STRPTR)"nested path + Latin-1 filenote round-trip");
+    if (!lt_ensure_dir((STRPTR)LT_RAMDIR)) {
+        lt_end(FALSE, (STRPTR)"mkdir failed");
+        return;
+    }
+    if (!lt_ensure_dir((STRPTR)LT_EXTRACT_DIR)) {
+        lt_end(FALSE, (STRPTR)"mkdir Out failed");
+        return;
+    }
+    lt_remove_path((STRPTR)LT_CHAR_ARC);
+
+    tags[0].ti_Tag = LHADD_Method;
+    tags[0].ti_Data = (ULONG)LT_METHOD_LH0;
+    tags[1].ti_Tag = LHADD_Comment;
+    tags[1].ti_Data = (ULONG)LT_CHAR_COMMENT;
+    tags[2].ti_Tag = TAG_DONE;
+
+    arc = LhOpenArchive((STRPTR)LT_CHAR_ARC, LHARC_MODE_WRITE);
+    if (arc == NULL) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!LhAddEntryA(arc, (STRPTR)LT_CHAR_ENTRY, payload,
+            (LONG)(sizeof(payload) - 1), tags)) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        LhCloseArchive(arc);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!LhCloseArchive(arc)) {
+        lt_end(FALSE, (STRPTR)"close failed");
+        return;
+    }
+
+    arc = LhOpenArchive((STRPTR)LT_CHAR_ARC, LHARC_MODE_READ);
+    if (arc == NULL) {
+        lt_end(FALSE, (STRPTR)"reopen failed");
+        return;
+    }
+    strcpy(out_path, LT_EXTRACT_DIR);
+    if (out_path[strlen(out_path) - 1] != ':' && out_path[strlen(out_path) - 1] != '/') {
+        strcat(out_path, "/");
+    }
+    strcat(out_path, "note.txt");
+    lt_remove_path((STRPTR)out_path);
+    if (!LhExtractEntry(arc, (STRPTR)LT_CHAR_ENTRY, (STRPTR)out_path)) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        LhCloseArchive(arc);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    LhCloseArchive(arc);
+
+    out_comment[0] = '\0';
+    out_prot = 0;
+    if (!lt_disk_examine((STRPTR)out_path, &out_prot, (STRPTR)out_comment,
+            (LONG)sizeof(out_comment))) {
+        lt_end(FALSE, (STRPTR)"Examine extract failed");
+        return;
+    }
+    if (strcmp(out_comment, LT_CHAR_COMMENT) != 0) {
+        sprintf(detail, "comment got len=%ld", (long)strlen(out_comment));
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    lt_end(TRUE, (STRPTR)"Latin-1 filenote restored");
+}
+
+/*
+ * Add with an explicit LHADD_Method (lh5 / store / etc).
+ */
+static BOOL
+lt_add_method(struct LhArchive *arc, STRPTR name, APTR data, LONG len,
+    LONG method)
+{
+    struct TagItem tags[3];
+
+    tags[0].ti_Tag = LHADD_Method;
+    tags[0].ti_Data = (ULONG)method;
+    tags[1].ti_Tag = LHADD_Attrs;
+    tags[1].ti_Data = 0UL;
+    tags[2].ti_Tag = TAG_DONE;
+    return LhAddEntryA(arc, name, data, len, tags) ? TRUE : FALSE;
+}
+
+/*
+ * Fill buf with a simple LCG so lh5 often expands; library must fall back
+ * to lh0 rather than failing with LhErr 223.
+ */
+static VOID
+lt_fill_noise(UBYTE *buf, LONG len, ULONG seed)
+{
+    LONG i;
+    ULONG x;
+
+    x = seed;
+    for (i = 0; i < len; i++) {
+        x = x * 1103515245UL + 12345UL;
+        buf[i] = (UBYTE)((x >> 16) & 0xffUL);
+    }
+}
+
+/*
+ * Repeating short motifs stress the lh5 hash chain / ring without needing
+ * megabytes on Amiga RAM.
+ */
+static VOID
+lt_fill_lh5_stress(UBYTE *buf, LONG len)
+{
+    LONG i;
+    static const char motif[] = "AaBbCc0123456789Lh5Hash";
+
+    for (i = 0; i < len; i++) {
+        buf[i] = (UBYTE)motif[i % (LONG)(sizeof(motif) - 1)];
+        if ((i & 31) == 0) {
+            buf[i] ^= (UBYTE)(i & 0xff);
+        }
+    }
+}
+
+/*
+ * LHADD_Method=5 must succeed for compressible and expanding payloads.
+ * Expanding data may be stored as -lh0-; LhErr 223 is a regression.
+ */
+static VOID
+lt_test_lh5_add_roundtrip(VOID)
+{
+    struct LhArchive *arc;
+    APTR round;
+    UBYTE *comp;
+    UBYTE *noise;
+    LONG round_len;
+    LONG n;
+    char detail[48];
+
+    comp = NULL;
+    noise = NULL;
+    round = NULL;
+    n = 512L;
+
+    lt_begin((STRPTR)"LhAddEntryA(lh5)",
+        (STRPTR)"lh5 method round-trip + expand fallback");
+    if (!lt_ensure_dir((STRPTR)LT_RAMDIR)) {
+        lt_end(FALSE, (STRPTR)"mkdir failed");
+        return;
+    }
+    lt_remove_path((STRPTR)LT_REG_ARC);
+
+    comp = (UBYTE *)AllocMem((ULONG)n, MEMF_PUBLIC | MEMF_CLEAR);
+    noise = (UBYTE *)AllocMem((ULONG)n, MEMF_PUBLIC | MEMF_CLEAR);
+    if (comp == NULL || noise == NULL) {
+        if (comp != NULL) {
+            FreeMem(comp, (ULONG)n);
+        }
+        if (noise != NULL) {
+            FreeMem(noise, (ULONG)n);
+        }
+        lt_end(FALSE, (STRPTR)"AllocMem failed");
+        return;
+    }
+    memset(comp, 0x55, (size_t)n);
+    lt_fill_noise(noise, n, 0xC0FFEEuL);
+
+    arc = LhOpenArchive((STRPTR)LT_REG_ARC, LHARC_MODE_WRITE);
+    if (arc == NULL) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        FreeMem(comp, (ULONG)n);
+        FreeMem(noise, (ULONG)n);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!lt_add_method(arc, (STRPTR)LT_REG_LH5_ENT, (APTR)comp, n,
+            LT_METHOD_LH5)) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        LhCloseArchive(arc);
+        FreeMem(comp, (ULONG)n);
+        FreeMem(noise, (ULONG)n);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!lt_add_method(arc, (STRPTR)"reg/noise.bin", (APTR)noise, n,
+            LT_METHOD_LH5)) {
+        /*
+         * Pre-fix: compress expand/fail mapped to ERROR_WRITE_PROTECTED
+         * (223).  Must not happen after lh0 fallback.
+         */
+        sprintf(detail, "noise LhErr %ld", (long)LhErr());
+        LhCloseArchive(arc);
+        FreeMem(comp, (ULONG)n);
+        FreeMem(noise, (ULONG)n);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!LhCloseArchive(arc)) {
+        FreeMem(comp, (ULONG)n);
+        FreeMem(noise, (ULONG)n);
+        lt_end(FALSE, (STRPTR)"close failed");
+        return;
+    }
+
+    arc = LhOpenArchive((STRPTR)LT_REG_ARC, LHARC_MODE_READ);
+    if (arc == NULL) {
+        FreeMem(comp, (ULONG)n);
+        FreeMem(noise, (ULONG)n);
+        lt_end(FALSE, (STRPTR)"reopen failed");
+        return;
+    }
+    round_len = LhReadData(arc, (STRPTR)LT_REG_LH5_ENT, &round);
+    if (round_len != n || round == NULL
+            || memcmp(round, comp, (size_t)n) != 0) {
+        sprintf(detail, "comp len=%ld", (long)round_len);
+        if (round != NULL) {
+            FreeMem(round, (ULONG)round_len > 0 ? (ULONG)round_len : 1UL);
+        }
+        LhCloseArchive(arc);
+        FreeMem(comp, (ULONG)n);
+        FreeMem(noise, (ULONG)n);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    FreeMem(round, (ULONG)round_len);
+    round = NULL;
+    round_len = LhReadData(arc, (STRPTR)"reg/noise.bin", &round);
+    if (round_len != n || round == NULL
+            || memcmp(round, noise, (size_t)n) != 0) {
+        sprintf(detail, "noise len=%ld", (long)round_len);
+        if (round != NULL) {
+            FreeMem(round, (ULONG)round_len > 0 ? (ULONG)round_len : 1UL);
+        }
+        LhCloseArchive(arc);
+        FreeMem(comp, (ULONG)n);
+        FreeMem(noise, (ULONG)n);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    FreeMem(round, (ULONG)round_len);
+    LhCloseArchive(arc);
+    FreeMem(comp, (ULONG)n);
+    FreeMem(noise, (ULONG)n);
+    lt_end(TRUE, (STRPTR)"lh5 + expand-fallback ok");
+}
+
+/*
+ * ~8KB patterned payload: must finish (no hash-chain hang) and round-trip.
+ */
+static VOID
+lt_test_lh5_hash_stress(VOID)
+{
+    struct LhArchive *arc;
+    APTR round;
+    UBYTE *buf;
+    LONG round_len;
+    char detail[48];
+
+    buf = NULL;
+    round = NULL;
+
+    lt_begin((STRPTR)"LhAddEntryA(lh5 stress)",
+        (STRPTR)"8KB patterned lh5 finishes + round-trip");
+    if (!lt_ensure_dir((STRPTR)LT_RAMDIR)) {
+        lt_end(FALSE, (STRPTR)"mkdir failed");
+        return;
+    }
+    lt_remove_path((STRPTR)LT_REG_ARC);
+
+    buf = (UBYTE *)AllocMem((ULONG)LT_REG_STRESS_SZ, MEMF_PUBLIC | MEMF_CLEAR);
+    if (buf == NULL) {
+        lt_end(FALSE, (STRPTR)"AllocMem failed");
+        return;
+    }
+    lt_fill_lh5_stress(buf, LT_REG_STRESS_SZ);
+
+    arc = LhOpenArchive((STRPTR)LT_REG_ARC, LHARC_MODE_WRITE);
+    if (arc == NULL) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        FreeMem(buf, (ULONG)LT_REG_STRESS_SZ);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!lt_add_method(arc, (STRPTR)LT_REG_STRESS, (APTR)buf,
+            LT_REG_STRESS_SZ, LT_METHOD_LH5)) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        LhCloseArchive(arc);
+        FreeMem(buf, (ULONG)LT_REG_STRESS_SZ);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!LhCloseArchive(arc)) {
+        FreeMem(buf, (ULONG)LT_REG_STRESS_SZ);
+        lt_end(FALSE, (STRPTR)"close failed");
+        return;
+    }
+
+    arc = LhOpenArchive((STRPTR)LT_REG_ARC, LHARC_MODE_READ);
+    if (arc == NULL) {
+        FreeMem(buf, (ULONG)LT_REG_STRESS_SZ);
+        lt_end(FALSE, (STRPTR)"reopen failed");
+        return;
+    }
+    round_len = LhReadData(arc, (STRPTR)LT_REG_STRESS, &round);
+    if (round_len != LT_REG_STRESS_SZ || round == NULL
+            || memcmp(round, buf, (size_t)LT_REG_STRESS_SZ) != 0) {
+        if (round_len < 0) {
+            sprintf(detail, "read LhErr %ld", (long)LhErr());
+        } else {
+            sprintf(detail, "len=%ld mismatch", (long)round_len);
+        }
+        if (round != NULL) {
+            FreeMem(round,
+                (ULONG)round_len > 0 ? (ULONG)round_len : 1UL);
+        }
+        LhCloseArchive(arc);
+        FreeMem(buf, (ULONG)LT_REG_STRESS_SZ);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    FreeMem(round, (ULONG)round_len);
+    LhCloseArchive(arc);
+    FreeMem(buf, (ULONG)LT_REG_STRESS_SZ);
+    lt_end(TRUE, (STRPTR)"stress round-trip");
+}
+
+/*
+ * All-identical bytes at Prefs/.info sizes.  Pre-fix lh5 second pass
+ * spun forever once a match was chosen near EOF (CheckSys SET lockup).
+ */
+static VOID
+lt_test_lh5_identical(VOID)
+{
+    struct LhArchive *arc;
+    APTR round;
+    UBYTE *buf;
+    LONG round_len;
+    LONG n;
+    LONG s;
+    LONG i;
+    static const LONG sizes[] = {
+        16L, 64L, 100L, 200L, 256L, 257L, 512L, 1024L, 4096L
+    };
+    char name[32];
+    char detail[48];
+
+    buf = NULL;
+    round = NULL;
+    n = (LONG)(sizeof(sizes) / sizeof(sizes[0]));
+
+    lt_begin((STRPTR)"LhAddEntryA(lh5 identical)",
+        (STRPTR)"all-0x55 sizes finish (EOF hang regression)");
+    if (!lt_ensure_dir((STRPTR)LT_RAMDIR)) {
+        lt_end(FALSE, (STRPTR)"mkdir failed");
+        return;
+    }
+    lt_remove_path((STRPTR)LT_REG_ARC);
+
+    buf = (UBYTE *)AllocMem(4096UL, MEMF_PUBLIC | MEMF_CLEAR);
+    if (buf == NULL) {
+        lt_end(FALSE, (STRPTR)"AllocMem failed");
+        return;
+    }
+    memset(buf, 0x55, 4096);
+
+    arc = LhOpenArchive((STRPTR)LT_REG_ARC, LHARC_MODE_WRITE);
+    if (arc == NULL) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        FreeMem(buf, 4096UL);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        s = sizes[i];
+        sprintf(name, "id/%ld.bin", (long)s);
+        if (!lt_add_method(arc, (STRPTR)name, (APTR)buf, s, LT_METHOD_LH5)) {
+            sprintf(detail, "add %ld LhErr %ld", (long)s, (long)LhErr());
+            LhCloseArchive(arc);
+            FreeMem(buf, 4096UL);
+            lt_end(FALSE, (STRPTR)detail);
+            return;
+        }
+    }
+    if (!LhCloseArchive(arc)) {
+        FreeMem(buf, 4096UL);
+        lt_end(FALSE, (STRPTR)"close failed");
+        return;
+    }
+
+    arc = LhOpenArchive((STRPTR)LT_REG_ARC, LHARC_MODE_READ);
+    if (arc == NULL) {
+        FreeMem(buf, 4096UL);
+        lt_end(FALSE, (STRPTR)"reopen failed");
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        s = sizes[i];
+        sprintf(name, "id/%ld.bin", (long)s);
+        round = NULL;
+        round_len = LhReadData(arc, (STRPTR)name, &round);
+        if (round_len != s || round == NULL
+                || memcmp(round, buf, (size_t)s) != 0) {
+            sprintf(detail, "sz=%ld len=%ld", (long)s, (long)round_len);
+            if (round != NULL) {
+                FreeMem(round,
+                    (ULONG)round_len > 0 ? (ULONG)round_len : 1UL);
+            }
+            LhCloseArchive(arc);
+            FreeMem(buf, 4096UL);
+            lt_end(FALSE, (STRPTR)detail);
+            return;
+        }
+        FreeMem(round, (ULONG)round_len);
+    }
+    LhCloseArchive(arc);
+    FreeMem(buf, 4096UL);
+    lt_end(TRUE, (STRPTR)"identical sizes ok");
+}
+
+/*
+ * Many lh5+snapshot adds without close between (CheckSys Prefs.lha SET).
+ */
+static VOID
+lt_test_lh5_many_snap(VOID)
+{
+    struct LhArchive *arc;
+    struct LhSnapshot *sn;
+    struct TagItem tags[4];
+    UBYTE *buf;
+    APTR round;
+    LONG round_len;
+    LONG i;
+    LONG j;
+    char name[40];
+    char detail[48];
+
+    buf = NULL;
+    sn = NULL;
+    round = NULL;
+
+    lt_begin((STRPTR)"LhAddEntryA(lh5 many)",
+        (STRPTR)"48x lh5+snapshot APPEND-style adds");
+    if (!lt_ensure_dir((STRPTR)LT_RAMDIR)) {
+        lt_end(FALSE, (STRPTR)"mkdir failed");
+        return;
+    }
+    lt_remove_path((STRPTR)LT_REG_ARC);
+
+    buf = (UBYTE *)AllocMem((ULONG)LT_REG_MANY_SZ, MEMF_PUBLIC | MEMF_CLEAR);
+    sn = (struct LhSnapshot *)AllocMem((ULONG)sizeof(*sn),
+        MEMF_PUBLIC | MEMF_CLEAR);
+    if (buf == NULL || sn == NULL) {
+        if (buf != NULL) {
+            FreeMem(buf, (ULONG)LT_REG_MANY_SZ);
+        }
+        if (sn != NULL) {
+            FreeMem(sn, (ULONG)sizeof(*sn));
+        }
+        lt_end(FALSE, (STRPTR)"AllocMem failed");
+        return;
+    }
+    /* Repetitive prefs-like body with a short distinct header. */
+    memset(buf, 0xAA, (size_t)LT_REG_MANY_SZ);
+    buf[0] = 'F';
+    buf[1] = 'O';
+    buf[2] = 'R';
+    buf[3] = 'M';
+
+    sn->lsn_Generation = 1UL;
+    sn->lsn_Size = (ULONG)LT_REG_MANY_SZ;
+    sn->lsn_Flags = 0;
+    sn->lsn_Format = LH_SNAP_FORMAT_V1;
+    for (j = 0; j < LH_SNAP_ID_LEN; j++) {
+        sn->lsn_SnapId[j] = (UBYTE)(0x30 + j);
+    }
+    for (j = 0; j < LH_SNAP_SHA256_LEN; j++) {
+        sn->lsn_SHA256[j] = (UBYTE)(0xC0 + (j & 0x0f));
+    }
+    strcpy(sn->lsn_Ver, "$VER: LhTest many 1.0");
+
+    tags[0].ti_Tag = LHADD_Method;
+    tags[0].ti_Data = (ULONG)LT_METHOD_LH5;
+    tags[1].ti_Tag = LHADD_Snapshot;
+    tags[1].ti_Data = (ULONG)sn;
+    tags[2].ti_Tag = TAG_DONE;
+
+    arc = LhOpenArchive((STRPTR)LT_REG_ARC, LHARC_MODE_WRITE);
+    if (arc == NULL) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        FreeMem(buf, (ULONG)LT_REG_MANY_SZ);
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    for (i = 0; i < LT_REG_MANY_N; i++) {
+        sprintf(name, "Prefs/f%ld.bin", (long)i);
+        sn->lsn_Generation = (ULONG)(i + 1);
+        buf[4] = (UBYTE)(i & 0xff);
+        if (!LhAddEntryA(arc, (STRPTR)name, (APTR)buf, LT_REG_MANY_SZ,
+                tags)) {
+            sprintf(detail, "i=%ld LhErr %ld", (long)i, (long)LhErr());
+            LhCloseArchive(arc);
+            FreeMem(buf, (ULONG)LT_REG_MANY_SZ);
+            FreeMem(sn, (ULONG)sizeof(*sn));
+            lt_end(FALSE, (STRPTR)detail);
+            return;
+        }
+    }
+    if (!LhCloseArchive(arc)) {
+        FreeMem(buf, (ULONG)LT_REG_MANY_SZ);
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        lt_end(FALSE, (STRPTR)"close failed");
+        return;
+    }
+
+    arc = LhOpenArchive((STRPTR)LT_REG_ARC, LHARC_MODE_READ);
+    if (arc == NULL) {
+        FreeMem(buf, (ULONG)LT_REG_MANY_SZ);
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        lt_end(FALSE, (STRPTR)"reopen failed");
+        return;
+    }
+    /* Spot-check first, middle, last. */
+    {
+        static const LONG check[] = { 0L, 24L, 47L };
+
+        for (i = 0; i < 3; i++) {
+            sprintf(name, "Prefs/f%ld.bin", (long)check[i]);
+            buf[4] = (UBYTE)(check[i] & 0xff);
+            round = NULL;
+            round_len = LhReadData(arc, (STRPTR)name, &round);
+            if (round_len != LT_REG_MANY_SZ || round == NULL
+                    || memcmp(round, buf, (size_t)LT_REG_MANY_SZ) != 0) {
+                sprintf(detail, "f%ld len=%ld", (long)check[i],
+                    (long)round_len);
+                if (round != NULL) {
+                    FreeMem(round,
+                        (ULONG)round_len > 0 ? (ULONG)round_len : 1UL);
+                }
+                LhCloseArchive(arc);
+                FreeMem(buf, (ULONG)LT_REG_MANY_SZ);
+                FreeMem(sn, (ULONG)sizeof(*sn));
+                lt_end(FALSE, (STRPTR)detail);
+                return;
+            }
+            FreeMem(round, (ULONG)round_len);
+        }
+    }
+    LhCloseArchive(arc);
+    FreeMem(buf, (ULONG)LT_REG_MANY_SZ);
+    FreeMem(sn, (ULONG)sizeof(*sn));
+    lt_end(TRUE, (STRPTR)"48 adds ok");
+}
+
+/*
+ * Delete while a writer is open (CheckPoint drop-slot path).  Must not
+ * deadlock; later adds and close must succeed; deleted member stays gone.
+ */
+static VOID
+lt_test_delete_while_writing(VOID)
+{
+    struct LhArchive *arc;
+    APTR round;
+    LONG round_len;
+    static UBYTE pa[] = "del-a";
+    static UBYTE pb[] = "del-b-payload";
+    static UBYTE pc[] = "del-c-after";
+    char detail[48];
+
+    round = NULL;
+
+    lt_begin((STRPTR)"LhDeleteFile(while write)",
+        (STRPTR)"delete mid-write then add + close");
+    if (!lt_ensure_dir((STRPTR)LT_RAMDIR)) {
+        lt_end(FALSE, (STRPTR)"mkdir failed");
+        return;
+    }
+    lt_remove_path((STRPTR)LT_REG_ARC);
+
+    arc = LhOpenArchive((STRPTR)LT_REG_ARC, LHARC_MODE_WRITE);
+    if (arc == NULL) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!lt_add_store(arc, (STRPTR)LT_REG_DEL_A, (APTR)pa,
+            (LONG)(sizeof(pa) - 1))) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        LhCloseArchive(arc);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!lt_add_store(arc, (STRPTR)LT_REG_DEL_B, (APTR)pb,
+            (LONG)(sizeof(pb) - 1))) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        LhCloseArchive(arc);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    /* Writer still open — this used to deadlock / corrupt. */
+    if (!LhDeleteFile(arc, (STRPTR)LT_REG_DEL_A)) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        LhCloseArchive(arc);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!lt_add_store(arc, (STRPTR)LT_REG_DEL_C, (APTR)pc,
+            (LONG)(sizeof(pc) - 1))) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        LhCloseArchive(arc);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!LhCloseArchive(arc)) {
+        lt_end(FALSE, (STRPTR)"close after delete failed");
+        return;
+    }
+
+    arc = LhOpenArchive((STRPTR)LT_REG_ARC, LHARC_MODE_READ);
+    if (arc == NULL) {
+        lt_end(FALSE, (STRPTR)"reopen failed");
+        return;
+    }
+    round_len = LhReadData(arc, (STRPTR)LT_REG_DEL_A, &round);
+    if (round_len >= 0 && round != NULL) {
+        FreeMem(round, (ULONG)round_len > 0 ? (ULONG)round_len : 1UL);
+        LhCloseArchive(arc);
+        lt_end(FALSE, (STRPTR)"A still present");
+        return;
+    }
+    round = NULL;
+    round_len = LhReadData(arc, (STRPTR)LT_REG_DEL_B, &round);
+    if (round_len != (LONG)(sizeof(pb) - 1) || round == NULL
+            || memcmp(round, pb, (size_t)(sizeof(pb) - 1)) != 0) {
+        sprintf(detail, "B len=%ld", (long)round_len);
+        if (round != NULL) {
+            FreeMem(round, (ULONG)round_len > 0 ? (ULONG)round_len : 1UL);
+        }
+        LhCloseArchive(arc);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    FreeMem(round, (ULONG)round_len);
+    round = NULL;
+    round_len = LhReadData(arc, (STRPTR)LT_REG_DEL_C, &round);
+    if (round_len != (LONG)(sizeof(pc) - 1) || round == NULL
+            || memcmp(round, pc, (size_t)(sizeof(pc) - 1)) != 0) {
+        sprintf(detail, "C len=%ld", (long)round_len);
+        if (round != NULL) {
+            FreeMem(round, (ULONG)round_len > 0 ? (ULONG)round_len : 1UL);
+        }
+        LhCloseArchive(arc);
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    FreeMem(round, (ULONG)round_len);
+    LhCloseArchive(arc);
+    lt_end(TRUE, (STRPTR)"A gone; B+C ok");
+}
+
+/*
+ * CheckPoint SET path: LHADD_Method lh5 + LHADD_Snapshot on one member.
+ */
+static VOID
+lt_test_lh5_snapshot(VOID)
+{
+    struct LhArchive *arc;
+    struct LhSnapshot *sn;
+    struct LhSnapshot *got;
+    struct TagItem tags[4];
+    static UBYTE payload[] = "lh5-snap-body";
+    LONG i;
+    char detail[64];
+
+    sn = NULL;
+    got = NULL;
+
+    lt_begin((STRPTR)"LhAddEntryA(lh5+snap)",
+        (STRPTR)"lh5 method + Snapshot round-trip");
+    if (!lt_ensure_dir((STRPTR)LT_RAMDIR)) {
+        lt_end(FALSE, (STRPTR)"mkdir failed");
+        return;
+    }
+    lt_remove_path((STRPTR)LT_REG_ARC);
+
+    sn = (struct LhSnapshot *)AllocMem((ULONG)sizeof(*sn),
+        MEMF_PUBLIC | MEMF_CLEAR);
+    got = (struct LhSnapshot *)AllocMem((ULONG)sizeof(*got),
+        MEMF_PUBLIC | MEMF_CLEAR);
+    if (sn == NULL || got == NULL) {
+        if (sn != NULL) {
+            FreeMem(sn, (ULONG)sizeof(*sn));
+        }
+        if (got != NULL) {
+            FreeMem(got, (ULONG)sizeof(*got));
+        }
+        lt_end(FALSE, (STRPTR)"AllocMem snapshot failed");
+        return;
+    }
+
+    sn->lsn_Generation = 7UL;
+    sn->lsn_Size = (ULONG)(sizeof(payload) - 1);
+    sn->lsn_Flags = 0;
+    sn->lsn_Format = LH_SNAP_FORMAT_V1;
+    for (i = 0; i < LH_SNAP_ID_LEN; i++) {
+        sn->lsn_SnapId[i] = (UBYTE)(0x20 + i);
+    }
+    for (i = 0; i < LH_SNAP_SHA256_LEN; i++) {
+        sn->lsn_SHA256[i] = (UBYTE)(0xB0 + (i & 0x0f));
+    }
+    strcpy(sn->lsn_Ver, "$VER: LhTest lh5 1.0");
+
+    tags[0].ti_Tag = LHADD_Method;
+    tags[0].ti_Data = (ULONG)LT_METHOD_LH5;
+    tags[1].ti_Tag = LHADD_Snapshot;
+    tags[1].ti_Data = (ULONG)sn;
+    tags[2].ti_Tag = TAG_DONE;
+
+    arc = LhOpenArchive((STRPTR)LT_REG_ARC, LHARC_MODE_WRITE);
+    if (arc == NULL) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!LhAddEntryA(arc, (STRPTR)LT_REG_SNAP, payload,
+            (LONG)(sizeof(payload) - 1), tags)) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        LhCloseArchive(arc);
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (!LhCloseArchive(arc)) {
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)"close failed");
+        return;
+    }
+
+    arc = LhOpenArchive((STRPTR)LT_REG_ARC, LHARC_MODE_READ);
+    if (arc == NULL) {
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)"reopen failed");
+        return;
+    }
+    memset(got, 0, sizeof(*got));
+    if (!LhGetSnapshot(arc, (STRPTR)LT_REG_SNAP, got)) {
+        lt_lherr_detail(detail, (LONG)sizeof(detail));
+        LhCloseArchive(arc);
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)detail);
+        return;
+    }
+    if (got->lsn_Generation != sn->lsn_Generation
+            || got->lsn_Size != sn->lsn_Size
+            || got->lsn_Format != sn->lsn_Format
+            || memcmp(got->lsn_SnapId, sn->lsn_SnapId,
+                (size_t)LH_SNAP_ID_LEN) != 0
+            || memcmp(got->lsn_SHA256, sn->lsn_SHA256,
+                (size_t)LH_SNAP_SHA256_LEN) != 0
+            || strcmp(got->lsn_Ver, sn->lsn_Ver) != 0) {
+        LhCloseArchive(arc);
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(FALSE, (STRPTR)"snapshot mismatch");
+        return;
+    }
+    LhCloseArchive(arc);
+    FreeMem(sn, (ULONG)sizeof(*sn));
+    FreeMem(got, (ULONG)sizeof(*got));
+    lt_end(TRUE, (STRPTR)"lh5+snapshot fields");
 }
 
 static VOID
@@ -1414,6 +2400,12 @@ lt_test_printentry(STRPTR path, STRPTR name)
         return;
     }
     if (LhPrintEntry(arc, name)) {
+        /*
+         * LhPrintEntry writes the raw payload to Output with no trailing
+         * newline; emit one so the PASS line is not glued to the text.
+         */
+        Printf("\n");
+        Flush(Output());
         lt_end(TRUE, (STRPTR)"DOSTRUE");
     } else {
         lt_end(FALSE, (STRPTR)"DOSFALSE");
@@ -1785,12 +2777,12 @@ lt_test_external(STRPTR path)
 static VOID
 lt_print_archive_skip(VOID)
 {
-    Printf("LhTest: SKIP 25 archive LVOs (fixture create failed):\n");
+    Printf("LhTest: SKIP archive LVOs (fixture create failed):\n");
     Printf("  LhOpenArchive LhCloseArchive LhLock LhUnLock LhExamine LhExNext\n");
     Printf("  LhExAll LhExAllEnd LhInfo LhOpenFromLock LhOpen LhRead LhWrite\n");
     Printf("  LhClose LhSeek LhNameFromLock LhAddEntryA\n");
     Printf("  LhDeleteFile LhConcatArchive LhSetPassword LhReadData\n");
-    Printf("  LhExtractEntry LhTestEntry LhPrintEntry LhErr\n");
+    Printf("  LhExtractEntry LhTestEntry LhPrintEntry LhErr LhGetSnapshot\n");
     Flush(Output());
 }
 
@@ -1815,6 +2807,14 @@ main(int argc, char **argv)
     lt_test_classic_buffer();
     lt_test_codec_lh0();
     lt_test_addentry_default();
+    lt_test_snapshot();
+    lt_test_charset_comment();
+    lt_test_lh5_add_roundtrip();
+    lt_test_lh5_hash_stress();
+    lt_test_lh5_identical();
+    lt_test_lh5_many_snap();
+    lt_test_delete_while_writing();
+    lt_test_lh5_snapshot();
     lt_test_fixture_create();
 
     if (lt_got_fixture) {

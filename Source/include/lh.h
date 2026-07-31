@@ -87,6 +87,22 @@ typedef unsigned char lh_attrs;
 
 #define LH_ATTR_DEFAULT ((lh_attrs)0)
 
+/* Snapshot member metadata (LHA ext 0x47, magic "LHSS"). */
+#define LH_SNAP_SHA256_LEN   32
+#define LH_SNAP_ID_LEN       16
+#define LH_SNAP_VER_MAX      199
+#define LH_SNAP_FORMAT_V1    1
+
+typedef struct lh_snapshot {
+    unsigned long generation;
+    unsigned long size;
+    unsigned char flags;
+    unsigned char format;
+    unsigned char sha256[LH_SNAP_SHA256_LEN];
+    unsigned char snap_id[LH_SNAP_ID_LEN];
+    char ver[LH_SNAP_VER_MAX + 1];
+} lh_snapshot;
+
 typedef struct lh_entry {
     char *filename;
     char *comment;
@@ -102,12 +118,17 @@ typedef struct lh_entry {
     int crc_ok;
     int is_directory;
     int is_encrypted;
+    /* Snapshot ext 0x47; present non-zero when have_snapshot set. */
+    int have_snapshot;
+    lh_snapshot snapshot;
 } lh_entry;
 
 typedef struct lh_writer lh_writer;
 typedef struct lh_reader lh_reader;
 
 /* In-memory buffer API (lh.library compatible shape). */
+#ifndef LH_STRUCT_LHBUFFER
+#define LH_STRUCT_LHBUFFER
 typedef struct LhBuffer {
     void *lh_Src;
     unsigned long lh_SrcSize;
@@ -117,6 +138,8 @@ typedef struct LhBuffer {
     unsigned long lh_AuxSize;
     unsigned long lh_Reserved;
 } LhBuffer;
+#endif
+/* If libraries/lh.h defined struct LhBuffer first, the typedef is there too. */
 
 #define LH_ENCODE_EXTRA(n) (((n) + 7u) >> 3)
 
@@ -161,7 +184,8 @@ lh_status lh_writer_add(
     lh_level level,
     int store_only,
     const unsigned char *data,
-    size_t data_len
+    size_t data_len,
+    const lh_snapshot *snapshot  /* NULL = no 0x47 ext */
 );
 lh_status lh_writer_close(lh_writer **w);
 

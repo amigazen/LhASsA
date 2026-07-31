@@ -54,5 +54,6 @@
 #pragma libcall LhBase LhTestEntry C6 9802
 #pragma libcall LhBase LhPrintEntry CC 9802
 #pragma libcall LhBase LhErr D2 00
+#pragma libcall LhBase LhGetSnapshot D8 A9803
 
 #endif /* PRAGMAS_LH_PRAGMAS_H */

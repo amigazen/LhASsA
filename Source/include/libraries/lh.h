@@ -31,6 +31,8 @@
 #define LH_MIN_VERSION  2
 #define ENCODEEXTRA(n)  (((n) + 7) >> 3)
 
+#ifndef LH_STRUCT_LHBUFFER
+#define LH_STRUCT_LHBUFFER
 struct LhBuffer
 {
     APTR    lh_Src;
@@ -41,6 +43,8 @@ struct LhBuffer
     ULONG   lh_AuxSize;
     ULONG   lh_Reserved;
 };
+typedef struct LhBuffer LhBuffer;
+#endif /* LH_STRUCT_LHBUFFER */
 
 struct LhArchive;
 
@@ -68,6 +72,28 @@ struct LhArchive;
 #define LHADD_DateStamp  (TAG_USER + 3)  /* ti_Data = struct DateStamp * */
 #define LHADD_Comment    (TAG_USER + 4)  /* ti_Data = STRPTR filenote */
 #define LHADD_Directory  (TAG_USER + 5)  /* ti_Data = nonzero -> -lhd- directory */
+#define LHADD_Snapshot   (TAG_USER + 6)  /* ti_Data = struct LhSnapshot * */
+
+/*
+ * Snapshot member metadata (LHA extended header 0x47, magic "LHSS").
+ * Written by LhAddEntryA with LHADD_Snapshot; read with LhGetSnapshot.
+ * Used by the CheckPoint product; lh.library names this Snapshot.
+ */
+#define LH_SNAP_SHA256_LEN   32
+#define LH_SNAP_ID_LEN       16
+#define LH_SNAP_VER_MAX      199
+#define LH_SNAP_FORMAT_V1    1
+
+struct LhSnapshot
+{
+    ULONG   lsn_Generation;
+    ULONG   lsn_Size;          /* recorded original size */
+    UBYTE   lsn_Flags;
+    UBYTE   lsn_Format;        /* LH_SNAP_FORMAT_V1 */
+    UBYTE   lsn_SHA256[LH_SNAP_SHA256_LEN];
+    UBYTE   lsn_SnapId[LH_SNAP_ID_LEN];
+    char    lsn_Ver[LH_SNAP_VER_MAX + 1];  /* optional $VER line; empty if none */
+};
 
 /*
  * Bin-profile LHA (Handle / Load): reserved LH0 stored member with a
