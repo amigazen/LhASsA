@@ -1030,6 +1030,133 @@ lt_test_snapshot(VOID)
     FreeMem(sn, (ULONG)sizeof(*sn));
     FreeMem(got, (ULONG)sizeof(*got));
     lt_end(TRUE, (STRPTR)"snapshot fields + negatives");
+
+    /*
+     * Same member path twice: LhGetSnapshot / extract use highest
+     * generation (CheckPoint multi-gen store).
+     */
+    {
+        static UBYTE payload_g1[] = "gen-one";
+        static UBYTE payload_g2[] = "gen-two-payload";
+        UBYTE *rdata;
+        LONG rlen;
+
+        sn = NULL;
+        got = NULL;
+        arc = NULL;
+        rdata = NULL;
+        rlen = 0;
+
+        lt_begin((STRPTR)"LhGetSnapshot multi-gen",
+            (STRPTR)"same name keeps max generation");
+        if (!lt_ensure_dir((STRPTR)LT_RAMDIR)) {
+            lt_end(FALSE, (STRPTR)"mkdir failed");
+            return;
+        }
+        lt_remove_path((STRPTR)LT_SNAP_ARC);
+
+        sn = (struct LhSnapshot *)AllocMem((ULONG)sizeof(*sn),
+            MEMF_PUBLIC | MEMF_CLEAR);
+        got = (struct LhSnapshot *)AllocMem((ULONG)sizeof(*got),
+            MEMF_PUBLIC | MEMF_CLEAR);
+        if (sn == NULL || got == NULL) {
+            if (sn != NULL) {
+                FreeMem(sn, (ULONG)sizeof(*sn));
+            }
+            if (got != NULL) {
+                FreeMem(got, (ULONG)sizeof(*got));
+            }
+            lt_end(FALSE, (STRPTR)"AllocMem snapshot failed");
+            return;
+        }
+
+        arc = LhOpenArchive((STRPTR)LT_SNAP_ARC, LHARC_MODE_WRITE);
+        if (arc == NULL) {
+            lt_lherr_detail(detail, (LONG)sizeof(detail));
+            FreeMem(sn, (ULONG)sizeof(*sn));
+            FreeMem(got, (ULONG)sizeof(*got));
+            lt_end(FALSE, (STRPTR)detail);
+            return;
+        }
+
+        memset(sn, 0, sizeof(*sn));
+        sn->lsn_Generation = 1UL;
+        sn->lsn_Size = (ULONG)(sizeof(payload_g1) - 1);
+        sn->lsn_Format = LH_SNAP_FORMAT_V1;
+        sn->lsn_SHA256[0] = 0x01;
+        tags[0].ti_Tag = LHADD_Method;
+        tags[0].ti_Data = (ULONG)LT_METHOD_LH0;
+        tags[1].ti_Tag = LHADD_Snapshot;
+        tags[1].ti_Data = (ULONG)sn;
+        tags[2].ti_Tag = TAG_DONE;
+        if (!LhAddEntryA(arc, (STRPTR)LT_SNAP_ENTRY, payload_g1,
+                (LONG)(sizeof(payload_g1) - 1), tags)) {
+            lt_lherr_detail(detail, (LONG)sizeof(detail));
+            LhCloseArchive(arc);
+            FreeMem(sn, (ULONG)sizeof(*sn));
+            FreeMem(got, (ULONG)sizeof(*got));
+            lt_end(FALSE, (STRPTR)detail);
+            return;
+        }
+
+        sn->lsn_Generation = 2UL;
+        sn->lsn_Size = (ULONG)(sizeof(payload_g2) - 1);
+        sn->lsn_SHA256[0] = 0x02;
+        if (!LhAddEntryA(arc, (STRPTR)LT_SNAP_ENTRY, payload_g2,
+                (LONG)(sizeof(payload_g2) - 1), tags)) {
+            lt_lherr_detail(detail, (LONG)sizeof(detail));
+            LhCloseArchive(arc);
+            FreeMem(sn, (ULONG)sizeof(*sn));
+            FreeMem(got, (ULONG)sizeof(*got));
+            lt_end(FALSE, (STRPTR)detail);
+            return;
+        }
+        if (!LhCloseArchive(arc)) {
+            FreeMem(sn, (ULONG)sizeof(*sn));
+            FreeMem(got, (ULONG)sizeof(*got));
+            lt_end(FALSE, (STRPTR)"close failed");
+            return;
+        }
+        arc = NULL;
+
+        arc = LhOpenArchive((STRPTR)LT_SNAP_ARC, LHARC_MODE_READ);
+        if (arc == NULL) {
+            FreeMem(sn, (ULONG)sizeof(*sn));
+            FreeMem(got, (ULONG)sizeof(*got));
+            lt_end(FALSE, (STRPTR)"reopen failed");
+            return;
+        }
+        memset(got, 0, sizeof(*got));
+        if (!LhGetSnapshot(arc, (STRPTR)LT_SNAP_ENTRY, got)
+                || got->lsn_Generation != 2UL
+                || got->lsn_SHA256[0] != 0x02) {
+            sprintf(detail, "gen=%lu sha0=%lu",
+                (unsigned long)got->lsn_Generation,
+                (unsigned long)got->lsn_SHA256[0]);
+            LhCloseArchive(arc);
+            FreeMem(sn, (ULONG)sizeof(*sn));
+            FreeMem(got, (ULONG)sizeof(*got));
+            lt_end(FALSE, (STRPTR)detail);
+            return;
+        }
+        rlen = LhReadData(arc, (STRPTR)LT_SNAP_ENTRY, (APTR *)&rdata);
+        if (rlen != (LONG)(sizeof(payload_g2) - 1) || rdata == NULL
+                || memcmp(rdata, payload_g2, (size_t)rlen) != 0) {
+            if (rdata != NULL && rlen > 0) {
+                FreeMem(rdata, (ULONG)rlen);
+            }
+            LhCloseArchive(arc);
+            FreeMem(sn, (ULONG)sizeof(*sn));
+            FreeMem(got, (ULONG)sizeof(*got));
+            lt_end(FALSE, (STRPTR)"read not latest payload");
+            return;
+        }
+        FreeMem(rdata, (ULONG)rlen);
+        LhCloseArchive(arc);
+        FreeMem(sn, (ULONG)sizeof(*sn));
+        FreeMem(got, (ULONG)sizeof(*got));
+        lt_end(TRUE, (STRPTR)"gen2 wins GetSnapshot+ReadData");
+    }
 }
 
 /*

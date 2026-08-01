@@ -22,12 +22,13 @@ struct LHBase
     ULONG lhb_Pad;
     LONG lhb_Err;
     /*
-     * Handler: AllocVec the .lha bytes (via private-reply host I/O), set these,
-     * then LhOpenArchive.  Consumed on open as a memory stream so catalog and
-     * extract never dos WaitPkt on the handler's pr_MsgPort.
+     * Handler: AllocVec the .lha bytes (via private-reply host I/O), set these
+     * plus lhb_PendingPath, then LhOpenArchive(path).  Consumed only when path
+     * matches PendingPath so a stale handoff cannot redirect CheckSys/TO opens.
      */
     APTR lhb_PendingMem;
     ULONG lhb_PendingMemLen;
+    char lhb_PendingPath[256];
 };
 
 #endif /* LIBRARIES_LHBASE_H */

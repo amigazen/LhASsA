@@ -325,8 +325,8 @@ long lh_stream_tell(const lh_stream *s);
 #endif
 /*
  * Must match lib_source/lh/lhbase.h and SDK libraries/lhbase.h.
- * Handler may set lhb_PendingMem (AllocVec) before LhOpenArchive; the next
- * lh_stream_open_read / lh_arc_open consumes it as a memory-backed archive.
+ * Handler may set lhb_PendingMem + lhb_PendingPath before LhOpenArchive;
+ * open consumes the handoff only when the requested path matches.
  */
 struct LHBase {
     struct Library lhb_LibNode;
@@ -335,6 +335,7 @@ struct LHBase {
     LONG lhb_Err;
     APTR lhb_PendingMem;
     ULONG lhb_PendingMemLen;
+    char lhb_PendingPath[256];
 };
 extern struct LHBase *LhBase;
 #endif

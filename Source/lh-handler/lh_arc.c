@@ -271,12 +271,25 @@ static struct LhArchive *lhh_open_archive_mem(GD gd, const char *real_path,
     }
     lhb->lhb_PendingMem = mem;
     lhb->lhb_PendingMemLen = mem_len;
+    {
+        size_t n;
+
+        n = 0;
+        if (real_path != NULL) {
+            while (real_path[n] != '\0' && n < sizeof(lhb->lhb_PendingPath) - 1) {
+                lhb->lhb_PendingPath[n] = real_path[n];
+                n++;
+            }
+        }
+        lhb->lhb_PendingPath[n] = '\0';
+    }
     archive = LhOpenArchive((STRPTR)real_path, LHARC_MODE_READ);
     if (archive == NULL) {
         if (lhb->lhb_PendingMem != NULL) {
             FreeVec(lhb->lhb_PendingMem);
             lhb->lhb_PendingMem = NULL;
             lhb->lhb_PendingMemLen = 0;
+            lhb->lhb_PendingPath[0] = '\0';
         }
         if (err) {
             *err = LhErr();

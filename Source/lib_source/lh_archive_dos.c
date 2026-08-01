@@ -379,25 +379,69 @@ static void lh_ref_to_fib(const struct lh_arc_entry_ref *ref, struct FileInfoBlo
 
 static int lh_name_match(const char *pattern, const char *name)
 {
+    size_t i;
+
     if (!pattern || !pattern[0] || strcmp(pattern, "*") == 0) {
         return 1;
     }
-    return strcmp(pattern, name) == 0;
+    if (!name) {
+        return 0;
+    }
+    /* AmigaDOS case-insensitive exact path match. */
+    for (i = 0; pattern[i] != '\0' || name[i] != '\0'; i++) {
+        char a;
+        char b;
+
+        a = pattern[i];
+        b = name[i];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (char)(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
+/*
+ * Resolve Name to a catalog index.  When several members share the same
+ * path (CheckPoint generations), pick the highest lsn_Generation; ties
+ * take the later catalog index (append order).  Members without a
+ * Snapshot are treated as generation 0.
+ */
 static LONG lh_find_entry_index(struct LhArchive *arc, const char *name)
 {
     LONG i;
+    LONG best;
+    ULONG best_gen;
 
     if (!arc || !name) {
         return -1;
     }
+    best = -1;
+    best_gen = 0;
     for (i = 0; i < arc->catalog_count; i++) {
-        if (lh_name_match(name, arc->catalog[i].name)) {
-            return i;
+        ULONG gen;
+
+        if (!lh_name_match(name, arc->catalog[i].name)) {
+            continue;
+        }
+        gen = 0;
+        if (arc->catalog[i].have_snapshot
+                && arc->catalog[i].snapshot.format
+                    == (unsigned char)LH_SNAP_FORMAT_V1) {
+            gen = arc->catalog[i].snapshot.generation;
+        }
+        if (best < 0 || gen > best_gen || (gen == best_gen && i > best)) {
+            best = i;
+            best_gen = gen;
         }
     }
-    return -1;
+    return best;
 }
 
 /*
@@ -932,16 +976,45 @@ struct LhArchive *lh_arc_open(STRPTR path, LONG mode)
     }
     /*
      * Prefer pending memory image from the handler (private-reply load).
-     * owned=0: FreeVec on lh_arc_close via file_mem.
+     * owned=0: FreeVec on lh_arc_close via file_mem.  Path must match
+     * PendingPath so CheckSys opening Work:CheckPoint drawer LHAs cannot
+     * steal a stale LHA: handoff.
      */
     if (LhBase != NULL && LhBase->lhb_PendingMem != NULL
-        && LhBase->lhb_PendingMemLen > 0) {
-        arc->file_mem = (unsigned char *)LhBase->lhb_PendingMem;
-        arc->file_mem_len = LhBase->lhb_PendingMemLen;
-        LhBase->lhb_PendingMem = NULL;
-        LhBase->lhb_PendingMemLen = 0;
-        arc->reader = lh_reader_open_mem(arc->file_mem, arc->file_mem_len, 0,
-            &err);
+        && LhBase->lhb_PendingMemLen > 0
+        && LhBase->lhb_PendingPath[0] != '\0') {
+        size_t i;
+        int match;
+
+        match = 1;
+        for (i = 0; path[i] != '\0' || LhBase->lhb_PendingPath[i] != '\0'; i++) {
+            char a;
+            char b;
+
+            a = (char)path[i];
+            b = LhBase->lhb_PendingPath[i];
+            if (a >= 'A' && a <= 'Z') {
+                a = (char)(a - 'A' + 'a');
+            }
+            if (b >= 'A' && b <= 'Z') {
+                b = (char)(b - 'A' + 'a');
+            }
+            if (a != b) {
+                match = 0;
+                break;
+            }
+        }
+        if (match) {
+            arc->file_mem = (unsigned char *)LhBase->lhb_PendingMem;
+            arc->file_mem_len = LhBase->lhb_PendingMemLen;
+            LhBase->lhb_PendingMem = NULL;
+            LhBase->lhb_PendingMemLen = 0;
+            LhBase->lhb_PendingPath[0] = '\0';
+            arc->reader = lh_reader_open_mem(arc->file_mem, arc->file_mem_len, 0,
+                &err);
+        } else {
+            arc->reader = lh_reader_open(arc->path, &err);
+        }
     } else {
         arc->reader = lh_reader_open(arc->path, &err);
     }
@@ -1543,11 +1616,38 @@ BPTR lh_arc_open_from_lock(BPTR lock_bptr, LONG mode)
     return (BPTR)fh;
 }
 
+/*
+ * Create one directory level if missing.  Prefer Lock: CreateDir on an
+ * existing drawer can return ERROR_OBJECT_IN_USE (202) while Workbench or
+ * another task holds it, which falsely fails extract of a sibling file.
+ */
+static int lh_arc_mkdir_one(STRPTR path)
+{
+    BPTR lock;
+
+    if (!path || !path[0]) {
+        return 0;
+    }
+    lock = Lock(path, SHARED_LOCK);
+    if (lock != (BPTR)NULL) {
+        UnLock(lock);
+        return 1;
+    }
+    lock = CreateDir(path);
+    if (lock != (BPTR)NULL) {
+        UnLock(lock);
+        return 1;
+    }
+    if (IoErr() == ERROR_OBJECT_EXISTS) {
+        return 1;
+    }
+    return 0;
+}
+
 static int lh_arc_mkdir_chain(STRPTR dirpath)
 {
     char *buf;
     char *p;
-    BPTR lock;
     int ok;
 
     if (!dirpath || !dirpath[0]) {
@@ -1563,23 +1663,16 @@ static int lh_arc_mkdir_chain(STRPTR dirpath)
     for (p = buf + 1; *p; p++) {
         if (*p == '/' || *p == '\\') {
             *p = '\0';
-            lock = CreateDir((STRPTR)buf);
-            if (lock == (BPTR)NULL && IoErr() != ERROR_OBJECT_EXISTS) {
+            if (!lh_arc_mkdir_one((STRPTR)buf)) {
                 ok = 0;
                 break;
-            }
-            if (lock != (BPTR)NULL) {
-                UnLock(lock);
             }
             *p = '/';
         }
     }
     if (ok) {
-        lock = CreateDir((STRPTR)buf);
-        if (lock == (BPTR)NULL && IoErr() != ERROR_OBJECT_EXISTS) {
+        if (!lh_arc_mkdir_one((STRPTR)buf)) {
             ok = 0;
-        } else if (lock != (BPTR)NULL) {
-            UnLock(lock);
         }
     }
     free(buf);
@@ -1698,7 +1791,12 @@ LONG lh_arc_extract_entry(struct LhArchive *arc, STRPTR name, STRPTR dest)
     }
     if (!lh_arc_ensure_parent(dest)) {
         FreeMem(data, (ULONG)len);
-        lh_arc_seterr(ERROR_OBJECT_IN_USE);
+        /* Prefer real dos IoErr from CreateDir/Lock; 202 was a blunt stand-in. */
+        if (IoErr() != 0) {
+            lh_arc_seterr(IoErr());
+        } else {
+            lh_arc_seterr(ERROR_OBJECT_NOT_FOUND);
+        }
         return DOSFALSE;
     }
     fh = Open(dest, MODE_NEWFILE);

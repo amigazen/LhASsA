@@ -771,8 +771,9 @@ static lh_status lh_hdr_read_level2(lh_stream *io, lh_hdr_meta *meta, unsigned c
     unsigned long ext_total;
     lh_status st;
     int padding;
-    unsigned char pb;
     size_t mem_len;
+
+    (void)io;
 
     header_size = (int)buf[0] + (int)((unsigned int)buf[1] << 8);
     if (header_size < 26) {
@@ -804,20 +805,18 @@ static lh_status lh_hdr_read_level2(lh_stream *io, lh_hdr_meta *meta, unsigned c
         return st;
     }
 
-    /* Bytes 24-25 are in the 26-byte base; body starts at offset 26. */
-    if (ext_total >= 2u) {
-        ext_total -= 2u;
-    }
-
-    padding = header_size - 26 - (int)ext_total;
-    if (padding < 0 || padding > 1) {
+    /*
+     * Trailing pad after the extension terminator is already in buf (we
+     * slurped header_size bytes).  Do not read it from io — that would steal
+     * packed-data bytes and desync the next member.  Classic LHA allows 0 or
+     * 1 pad byte; accept a little more for defensive writers.
+     */
+    if (ext_total > mem_len) {
         return LH_ERR_BAD_HEADER;
     }
-    while (padding > 0) {
-        if (lh_stream_read(io, &pb, 1) != 1) {
-            return LH_ERR_TRUNCATED;
-        }
-        padding--;
+    padding = (int)(mem_len - ext_total);
+    if (padding < 0 || padding > 20) {
+        return LH_ERR_BAD_HEADER;
     }
     if (!meta->filename) {
         return LH_ERR_BAD_HEADER;
@@ -1026,7 +1025,7 @@ static lh_status lh_hdr_read_lhex(lh_stream *io, lh_hdr_meta *meta, unsigned cha
 lh_status lh_hdr_read(lh_stream *io, lh_hdr_meta *meta, unsigned char write_level)
 {
     unsigned char *buf;
-    unsigned char hdr_len;
+    unsigned char first;
     int header_size;
     int header_level;
     size_t n;
@@ -1044,58 +1043,71 @@ lh_status lh_hdr_read(lh_stream *io, lh_hdr_meta *meta, unsigned char write_leve
     }
     memset(buf, 0, LH_HDR_BUF);
 
-    n = lh_stream_read(io, &hdr_len, 1);
+    /*
+     * Classic LHA (lha-1 get_header): read a 21-byte common prefix so the
+     * level byte at offset 20 is always available, then branch.  Level-2
+     * sizes are 16-bit LE in bytes 0..1; treating byte0 as a level-0 size
+     * rejects Snapshot headers whose size low byte is 1..20 (LhErr 224).
+     */
+    n = lh_stream_read(io, &first, 1);
     if (n != 1) {
         free(buf);
         return LH_ERR_TRUNCATED;
     }
-    if (hdr_len == 0) {
+    if (first == 0) {
         free(buf);
         return LH_ERR_TRUNCATED;
     }
-    if (hdr_len < 20) {
-        free(buf);
-        return LH_ERR_BAD_HEADER;
-    }
-    if ((size_t)hdr_len >= LH_HDR_BUF - 4u) {
-        free(buf);
-        return LH_ERR_BAD_HEADER;
-    }
-
-    buf[0] = hdr_len;
-    header_size = (int)hdr_len;
-
-    /*
-     * lhex/header.c: fread header_size-1, then 2-byte prefetch for level != 2.
-     * The prefetch byte(s) sit between the counted header body and packed data.
-     */
-    n = lh_stream_read(io, buf + LH_I_CHECKSUM, (size_t)header_size - 1u);
-    if (n != (size_t)header_size - 1u) {
+    buf[0] = first;
+    n = lh_stream_read(io, buf + 1, 20);
+    if (n != 20) {
         free(buf);
         return LH_ERR_TRUNCATED;
     }
     header_level = (int)buf[LH_I_LEVEL];
 
     if (header_level == 2) {
-        int initial_size;
-
-        initial_size = header_size;
         header_size = (int)buf[0] + (int)((unsigned int)buf[1] << 8);
         if (header_size < 26 || header_size >= LH_HDR_BUF - 4) {
             free(buf);
             return LH_ERR_BAD_HEADER;
         }
-        if (header_size > initial_size) {
-            n = lh_stream_read(io, buf + initial_size,
-                (size_t)header_size - (size_t)initial_size);
-            if (n != (size_t)header_size - (size_t)initial_size) {
+        if (header_size > 21) {
+            n = lh_stream_read(io, buf + 21,
+                (size_t)header_size - 21u);
+            if (n != (size_t)header_size - 21u) {
                 free(buf);
                 return LH_ERR_TRUNCATED;
             }
         }
-    } else if (lh_stream_read(io, buf + header_size, 2) != 2) {
-        free(buf);
-        return LH_ERR_TRUNCATED;
+    } else {
+        header_size = (int)first;
+        if (header_size < 20 || header_size >= LH_HDR_BUF - 4) {
+            free(buf);
+            return LH_ERR_BAD_HEADER;
+        }
+        /*
+         * Common prefix already consumed 21 bytes.  Level-0/1 headers shorter
+         * than that are not produced by real LHA writers; reject rather than
+         * invent a seek-back for the over-read.
+         */
+        if (header_size < 21) {
+            free(buf);
+            return LH_ERR_BAD_HEADER;
+        }
+        if (header_size > 21) {
+            n = lh_stream_read(io, buf + 21,
+                (size_t)header_size - 21u);
+            if (n != (size_t)header_size - 21u) {
+                free(buf);
+                return LH_ERR_TRUNCATED;
+            }
+        }
+        /* Prefetch between counted header body and packed data (lhex). */
+        if (lh_stream_read(io, buf + header_size, 2) != 2) {
+            free(buf);
+            return LH_ERR_TRUNCATED;
+        }
     }
 
     /*

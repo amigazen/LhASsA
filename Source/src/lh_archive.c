@@ -97,19 +97,46 @@ int lh_stream_open_read(lh_stream *s, const char *path)
 #ifdef LH_AMIGA
     /*
      * Handler may leave AllocVec'd archive bytes on LHBase so Open/Read never
-     * WaitPkt on the LHA: process MsgPort during catalog or extract.
+     * WaitPkt on the LHA: process MsgPort during catalog or extract.  Only
+     * consume when PendingPath matches this open — a stale handoff must not
+     * redirect CheckSys/TO= opens to the wrong archive image.
      */
     if (LhBase != NULL && LhBase->lhb_PendingMem != NULL
-        && LhBase->lhb_PendingMemLen > 0) {
-        APTR mem;
-        ULONG len;
+        && LhBase->lhb_PendingMemLen > 0
+        && LhBase->lhb_PendingPath[0] != '\0'
+        && path != NULL) {
+        size_t i;
+        int match;
 
-        mem = LhBase->lhb_PendingMem;
-        len = LhBase->lhb_PendingMemLen;
-        LhBase->lhb_PendingMem = NULL;
-        LhBase->lhb_PendingMemLen = 0;
-        (void)path;
-        return lh_stream_open_mem(s, mem, len, 1);
+        match = 1;
+        for (i = 0; path[i] != '\0' || LhBase->lhb_PendingPath[i] != '\0'; i++) {
+            char a;
+            char b;
+
+            a = path[i];
+            b = LhBase->lhb_PendingPath[i];
+            if (a >= 'A' && a <= 'Z') {
+                a = (char)(a - 'A' + 'a');
+            }
+            if (b >= 'A' && b <= 'Z') {
+                b = (char)(b - 'A' + 'a');
+            }
+            if (a != b) {
+                match = 0;
+                break;
+            }
+        }
+        if (match) {
+            APTR mem;
+            ULONG len;
+
+            mem = LhBase->lhb_PendingMem;
+            len = LhBase->lhb_PendingMemLen;
+            LhBase->lhb_PendingMem = NULL;
+            LhBase->lhb_PendingMemLen = 0;
+            LhBase->lhb_PendingPath[0] = '\0';
+            return lh_stream_open_mem(s, mem, len, 1);
+        }
     }
     s->lh_fh = Open((STRPTR)path, MODE_OLDFILE);
     return s->lh_fh != 0;

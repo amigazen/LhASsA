@@ -1299,6 +1299,10 @@ lh.library/LhGetSnapshot
        SetProtection (LHA attribute byte), SetFileDate, and SetComment
        (extension 0x3F / 0x46 filenote) when present.
 
+       Duplicate names (multi-generation stores) resolve like
+       LhGetSnapshot: highest Snapshot generation, else later catalog
+       index.
+
    INPUTS
        Archive  - archive opened for read.
        Name     - entry path within the archive.
@@ -1439,6 +1443,10 @@ lh.library/LhGetSnapshot
        Copies the snapshot index (LHA extended header 0x47, magic
        "LHSS") for Name into Out.  Entries without a 0x47 extension fail
        with ERROR_OBJECT_NOT_FOUND (same as a missing member).
+
+       If several members share Name (multi-generation CheckPoint
+       stores), the entry with the highest lsn_Generation is used; equal
+       generations prefer the later catalog index.
 
        Out receives generation, recorded size, flags, format, snap id
        (16 bytes), SHA-256 (32 bytes), and optional $VER string.  See

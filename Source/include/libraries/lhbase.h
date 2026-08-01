@@ -22,11 +22,12 @@ struct LHBase
     ULONG lhb_Pad;
     LONG lhb_Err;
     /*
-     * Set AllocVec'd archive bytes then call LhOpenArchive; consumed as a
-     * memory-backed stream (no dos WaitPkt during subsequent reads).
+     * Set AllocVec'd archive bytes and PendingPath, then LhOpenArchive(path).
+     * Consumed only when path matches PendingPath (avoids wrong-archive opens).
      */
     APTR lhb_PendingMem;
     ULONG lhb_PendingMemLen;
+    char lhb_PendingPath[256];
 };
 
 #endif /* LIBRARIES_LHBASE_H */
