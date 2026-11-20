@@ -12,6 +12,9 @@
  * Algorithm follows the well-known LHa for UNIX encode_start_st1 / send_block
  * / make_tree design (Okumura / Yoshizaki / Watazaki lineage).  This file is
  * an original C89 rewrite for LhaSA (heap state, no FILE*, no globals).
+ *
+ * Hot-path tuning (portable C89): match extend compares 4 bytes at a time
+ * before falling back to a byte scan — same hash/lazy parse, fewer loops.
  */
 
 #include "lh_internal.h"
@@ -581,18 +584,64 @@ lh5e_get_next(struct lh5_enc *e)
         & (unsigned long)(LH5E_HSHSIZ - 1);
 }
 
+/*
+ * Longest common prefix of a[] and b[], capped at max.
+ * Compares ULONG groups first (byte-wise equality, alignment-safe via
+ * memcpy into locals on hosts that fault on unaligned long loads — on
+ * Amiga 68020+ unaligned long is fine; on 68000 we only use this when
+ * both pointers share the same alignment mod 4, else byte loop).
+ */
+static unsigned long
+lh5e_match_len(
+    const unsigned char *a,
+    const unsigned char *b,
+    unsigned long max)
+{
+    unsigned long len;
+    unsigned long va;
+    unsigned long vb;
+
+    len = 0;
+    /* Same alignment → align to long, then compare 4 bytes at a time. */
+    if ((((unsigned long)a ^ (unsigned long)b) & 3UL) == 0) {
+        while (len < max && ((unsigned long)a & 3UL) != 0) {
+            if (*a != *b) {
+                return len;
+            }
+            a++;
+            b++;
+            len++;
+        }
+        while (len + 4 <= max) {
+            memcpy(&va, a, 4);
+            memcpy(&vb, b, 4);
+            if (va != vb) {
+                break;
+            }
+            a += 4;
+            b += 4;
+            len += 4;
+        }
+    }
+    while (len < max && *a == *b) {
+        a++;
+        b++;
+        len++;
+    }
+    return len;
+}
+
 static void
 lh5e_match_insert(struct lh5_enc *e)
 {
     unsigned long scan_pos;
     unsigned long scan_end;
     unsigned long len;
-    unsigned char *a;
-    unsigned char *b;
     unsigned long chain;
     unsigned long off;
     unsigned long h;
     unsigned long max;
+    unsigned long probe;
 
     max = e->maxmatch;
     if (e->matchlen < LH5E_THRESHOLD - 1) {
@@ -613,18 +662,23 @@ lh5e_match_insert(struct lh5_enc *e)
         chain = 0;
         scan_pos = e->hash[h];
         scan_end = (e->pos > e->dicsiz) ? e->pos + off - e->dicsiz : off;
+        probe = e->matchlen;
         while (scan_pos > scan_end) {
             chain++;
-            if (e->text[scan_pos + e->matchlen - off]
-                    == e->text[e->pos + e->matchlen]) {
-                a = e->text + scan_pos - off;
-                b = e->text + e->pos;
-                for (len = 0; len < max && *a++ == *b++; len++) {
-                    ;
-                }
+            /*
+             * Cheap reject: only run the full scan when the next byte
+             * past the current best match still agrees (classic lha).
+             */
+            if (e->text[scan_pos + probe - off]
+                    == e->text[e->pos + probe]) {
+                len = lh5e_match_len(
+                    e->text + scan_pos - off,
+                    e->text + e->pos,
+                    max);
                 if (len > e->matchlen) {
                     e->matchpos = scan_pos - off;
                     e->matchlen = len;
+                    probe = len;
                     if (len == max) {
                         break;
                     }

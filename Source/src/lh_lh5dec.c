@@ -10,10 +10,18 @@
  *   lh5: 8 KiB  (dicbit 13, pbit 4, np 14)
  *   lh6: 32 KiB (dicbit 15, pbit 5, np 16)
  *   lh7: 64 KiB (dicbit 16, pbit 5, np 17)
- *   lhx: UNLHA32 (dicbit 20, pbit 5, np 31) — 1 MiB history ring
+ *   lhx: UNLHA32 (dicbit 20, pbit 5, np 31) — 1 MiB history window
  *
- * Decoder state is malloc'd — the Huffman tables alone are ~13 KiB and
+ * Decoder state is malloc'd — the Huffman tables alone are ~20 KiB and
  * must not live on a typical Amiga process stack.
+ *
+ * Hot-path tuning (portable C89, 680x0-friendly):
+ *   - 32-bit LHarc bitbuf; fillbuf keeps working state in locals
+ *   - peek tables store (bitlen<<16)|sym after make_table so decode
+ *     needs one load instead of table + c_len / pt_len
+ *   - decode straight into outBuf (history = prior output; reads before
+ *     offset 0 yield 0x20).  No separate dictionary malloc or dual write.
+ *   - LZ match copy with ULONG moves when distance >= 4
  */
 
 #include "lh_internal.h"
@@ -29,12 +37,21 @@
 #define LH5_TBIT          5
 #define LH5_NPT           0x80
 
+#define LH5_BITBUF_BITS 32
+/* Mask so host LP64 unsigned long behaves like Amiga 32-bit ULONG. */
+#define LH5_BITBUF_MASK 0xffffffffUL
+
+#define LH5_PACK(len, sym) \
+    ((((unsigned long)(len)) << 16) | (unsigned long)(unsigned short)(sym))
+#define LH5_SYM(e)   ((unsigned short)(e))
+#define LH5_LEN(e)   ((unsigned int)((e) >> 16))
+
 struct lh5_dec {
     const unsigned char *in;
     unsigned long in_size;
     unsigned long in_pos;
     unsigned long compsize;
-    unsigned short bitbuf;
+    unsigned long bitbuf;
     unsigned char subbitbuf;
     unsigned char bitcount;
     unsigned short blocksize;
@@ -44,39 +61,55 @@ struct lh5_dec {
     unsigned short right[2 * LH5_NC - 1];
     unsigned char c_len[LH5_NC];
     unsigned char pt_len[LH5_NPT];
-    unsigned short c_table[4096];
-    unsigned short pt_table[256];
+    unsigned long c_table[4096];
+    unsigned long pt_table[256];
 };
 
-static void lh5_fillbuf(struct lh5_dec *d, unsigned char n)
+static void lh5_fillbuf(struct lh5_dec *d, unsigned int n)
 {
-    while (n > d->bitcount) {
-        n = (unsigned char)(n - d->bitcount);
-        d->bitbuf = (unsigned short)((d->bitbuf << d->bitcount)
-            + (d->subbitbuf >> (CHAR_BIT - d->bitcount)));
+    unsigned long bb;
+    unsigned int bc;
+    unsigned char sb;
+
+    if (n == 0) {
+        return;
+    }
+
+    bb = d->bitbuf;
+    bc = d->bitcount;
+    sb = d->subbitbuf;
+
+    while (n > bc) {
+        n -= bc;
+        bb = ((bb << bc) + ((unsigned long)sb >> (CHAR_BIT - bc)))
+            & LH5_BITBUF_MASK;
         if (d->compsize != 0) {
             d->compsize--;
             if (d->in_pos < d->in_size) {
-                d->subbitbuf = d->in[d->in_pos++];
+                sb = d->in[d->in_pos++];
             } else {
-                d->subbitbuf = 0;
+                sb = 0;
             }
         } else {
-            d->subbitbuf = 0;
+            sb = 0;
         }
-        d->bitcount = CHAR_BIT;
+        bc = CHAR_BIT;
     }
-    d->bitcount = (unsigned char)(d->bitcount - n);
-    d->bitbuf = (unsigned short)((d->bitbuf << n)
-        + (d->subbitbuf >> (CHAR_BIT - n)));
-    d->subbitbuf = (unsigned char)(d->subbitbuf << n);
+    bc -= n;
+    bb = ((bb << n) + ((unsigned long)sb >> (CHAR_BIT - n)))
+        & LH5_BITBUF_MASK;
+    sb = (unsigned char)(sb << n);
+
+    d->bitbuf = bb;
+    d->bitcount = (unsigned char)bc;
+    d->subbitbuf = sb;
 }
 
-static unsigned short lh5_getbits(struct lh5_dec *d, unsigned char n)
+static unsigned short lh5_getbits(struct lh5_dec *d, unsigned int n)
 {
     unsigned short x;
 
-    x = (unsigned short)(d->bitbuf >> (2 * CHAR_BIT - n));
+    x = (unsigned short)(d->bitbuf >> (LH5_BITBUF_BITS - n));
     lh5_fillbuf(d, n);
     return x;
 }
@@ -86,15 +119,20 @@ static void lh5_init_getbits(struct lh5_dec *d)
     d->bitbuf = 0;
     d->subbitbuf = 0;
     d->bitcount = 0;
-    lh5_fillbuf(d, (unsigned char)(2 * CHAR_BIT));
+    lh5_fillbuf(d, LH5_BITBUF_BITS);
 }
 
+/*
+ * Classic LHa make_table.  Peek slots are unsigned long with the symbol
+ * or tree-node index in the low 16 bits (high 16 clear).  lh5_pack_*
+ * folds bit lengths into the high half for leaf entries afterwards.
+ */
 static void lh5_make_table(
     struct lh5_dec *d,
     short nchar,
     unsigned char *bitlen,
     short tablebits,
-    unsigned short *table)
+    unsigned long *table)
 {
     unsigned short count[17];
     unsigned short weight[17];
@@ -107,7 +145,9 @@ static void lh5_make_table(
     int m;
     int n;
     int avail;
+    unsigned long *tp;
     unsigned short *p;
+    int on_table;
 
     avail = nchar;
     for (i = 1; i <= 16; i++) {
@@ -148,38 +188,82 @@ static void lh5_make_table(
         l = (int)start[k] + (int)weight[k];
         if (k <= tablebits) {
             for (i = start[k]; i < (unsigned int)l; i++) {
-                table[i] = (unsigned short)j;
+                table[i] = (unsigned long)(unsigned short)j;
             }
         } else {
-            p = &table[(i = start[k]) >> m];
+            tp = &table[(i = start[k]) >> m];
             i <<= tablebits;
             n = k - tablebits;
+            on_table = 1;
+            p = 0;
             while (--n >= 0) {
-                if (*p == 0) {
-                    /*
-                     * Corrupt/non-LH5 bit lengths can grow the tree past
-                     * left/right[]; abort instead of smashing the pool.
-                     */
-                    if (avail >= (2 * LH5_NC - 1)) {
+                if (on_table) {
+                    if (*tp == 0) {
+                        if (avail >= (2 * LH5_NC - 1)) {
+                            return;
+                        }
+                        d->right[avail] = 0;
+                        d->left[avail] = 0;
+                        *tp = (unsigned long)avail++;
+                    }
+                    if (LH5_SYM(*tp) >= (unsigned short)(2 * LH5_NC - 1)) {
                         return;
                     }
-                    d->right[avail] = 0;
-                    d->left[avail] = 0;
-                    *p = (unsigned short)avail++;
-                }
-                if (*p >= (unsigned short)(2 * LH5_NC - 1)) {
-                    return;
-                }
-                if (i & 0x8000u) {
-                    p = &d->right[*p];
+                    if (i & 0x8000u) {
+                        p = &d->right[LH5_SYM(*tp)];
+                    } else {
+                        p = &d->left[LH5_SYM(*tp)];
+                    }
+                    on_table = 0;
                 } else {
-                    p = &d->left[*p];
+                    if (*p == 0) {
+                        if (avail >= (2 * LH5_NC - 1)) {
+                            return;
+                        }
+                        d->right[avail] = 0;
+                        d->left[avail] = 0;
+                        *p = (unsigned short)avail++;
+                    }
+                    if (*p >= (unsigned short)(2 * LH5_NC - 1)) {
+                        return;
+                    }
+                    if (i & 0x8000u) {
+                        p = &d->right[*p];
+                    } else {
+                        p = &d->left[*p];
+                    }
                 }
                 i <<= 1;
             }
             *p = (unsigned short)j;
         }
         start[k] = (unsigned short)l;
+    }
+}
+
+static void lh5_pack_c_table(struct lh5_dec *d)
+{
+    unsigned int i;
+    unsigned short j;
+
+    for (i = 0; i < 4096; i++) {
+        j = LH5_SYM(d->c_table[i]);
+        if (j < LH5_NC) {
+            d->c_table[i] = LH5_PACK(d->c_len[j], j);
+        }
+    }
+}
+
+static void lh5_pack_pt_table(struct lh5_dec *d, short nchar)
+{
+    unsigned int i;
+    unsigned short j;
+
+    for (i = 0; i < 256; i++) {
+        j = LH5_SYM(d->pt_table[i]);
+        if (j < (unsigned short)nchar) {
+            d->pt_table[i] = LH5_PACK(d->pt_len[j], j);
+        }
     }
 }
 
@@ -192,29 +276,29 @@ static void lh5_read_pt_len(
     short i;
     short c;
     short n;
-    unsigned short mask;
+    unsigned long mask;
 
-    n = (short)lh5_getbits(d, (unsigned char)nbit);
+    n = (short)lh5_getbits(d, (unsigned int)nbit);
     if (n == 0) {
-        c = (short)lh5_getbits(d, (unsigned char)nbit);
+        c = (short)lh5_getbits(d, (unsigned int)nbit);
         for (i = 0; i < nn; i++) {
             d->pt_len[i] = 0;
         }
         for (i = 0; i < 256; i++) {
-            d->pt_table[i] = (unsigned short)c;
+            d->pt_table[i] = LH5_PACK(0, c);
         }
     } else {
         i = 0;
         while (i < n) {
-            c = (short)(d->bitbuf >> (16 - 3));
+            c = (short)(d->bitbuf >> (LH5_BITBUF_BITS - 3));
             if (c == 7) {
-                mask = (unsigned short)(1 << (16 - 4));
+                mask = 1UL << (LH5_BITBUF_BITS - 4);
                 while (mask & d->bitbuf) {
-                    mask = (unsigned short)(mask >> 1);
+                    mask >>= 1;
                     c++;
                 }
             }
-            lh5_fillbuf(d, (unsigned char)((c < 7) ? 3 : c - 3));
+            lh5_fillbuf(d, (unsigned int)((c < 7) ? 3 : c - 3));
             d->pt_len[i++] = (unsigned char)c;
             if (i == i_special) {
                 c = (short)lh5_getbits(d, 2);
@@ -227,6 +311,7 @@ static void lh5_read_pt_len(
             d->pt_len[i++] = 0;
         }
         lh5_make_table(d, nn, d->pt_len, 8, d->pt_table);
+        lh5_pack_pt_table(d, nn);
     }
 }
 
@@ -235,7 +320,8 @@ static void lh5_read_c_len(struct lh5_dec *d)
     short i;
     short c;
     short n;
-    unsigned short mask;
+    unsigned long mask;
+    unsigned long e;
 
     n = (short)lh5_getbits(d, LH5_CBIT);
     if (n == 0) {
@@ -244,24 +330,28 @@ static void lh5_read_c_len(struct lh5_dec *d)
             d->c_len[i] = 0;
         }
         for (i = 0; i < 4096; i++) {
-            d->c_table[i] = (unsigned short)c;
+            d->c_table[i] = LH5_PACK(0, c);
         }
     } else {
         i = 0;
         while (i < n) {
-            c = (short)d->pt_table[d->bitbuf >> (16 - 8)];
+            e = d->pt_table[d->bitbuf >> (LH5_BITBUF_BITS - 8)];
+            c = (short)LH5_SYM(e);
             if (c >= LH5_NT) {
-                mask = (unsigned short)(1 << (16 - 9));
+                /* Peeked 8 bits landed on a node; walk without consuming yet. */
+                mask = 1UL << (LH5_BITBUF_BITS - 9);
                 do {
                     if (d->bitbuf & mask) {
                         c = (short)d->right[c];
                     } else {
                         c = (short)d->left[c];
                     }
-                    mask = (unsigned short)(mask >> 1);
+                    mask >>= 1;
                 } while (c >= LH5_NT);
+                lh5_fillbuf(d, d->pt_len[c]);
+            } else {
+                lh5_fillbuf(d, LH5_LEN(e));
             }
-            lh5_fillbuf(d, d->pt_len[c]);
             if (c <= 2) {
                 if (c == 0) {
                     c = 1;
@@ -281,13 +371,15 @@ static void lh5_read_c_len(struct lh5_dec *d)
             d->c_len[i++] = 0;
         }
         lh5_make_table(d, LH5_NC, d->c_len, 12, d->c_table);
+        lh5_pack_c_table(d);
     }
 }
 
 static unsigned short lh5_decode_c(struct lh5_dec *d)
 {
+    unsigned long e;
     unsigned short j;
-    unsigned short mask;
+    unsigned long mask;
 
     if (d->blocksize == 0) {
         d->blocksize = lh5_getbits(d, 16);
@@ -296,56 +388,146 @@ static unsigned short lh5_decode_c(struct lh5_dec *d)
         lh5_read_pt_len(d, d->np, d->pbit, -1);
     }
     d->blocksize--;
-    j = d->c_table[d->bitbuf >> 4];
+    e = d->c_table[d->bitbuf >> (LH5_BITBUF_BITS - 12)];
+    j = LH5_SYM(e);
     if (j < LH5_NC) {
-        lh5_fillbuf(d, d->c_len[j]);
+        lh5_fillbuf(d, LH5_LEN(e));
     } else {
         lh5_fillbuf(d, 12);
-        mask = (unsigned short)(1 << (16 - 1));
+        mask = 1UL << (LH5_BITBUF_BITS - 1);
         do {
             if (d->bitbuf & mask) {
                 j = d->right[j];
             } else {
                 j = d->left[j];
             }
-            mask = (unsigned short)(mask >> 1);
+            mask >>= 1;
         } while (j >= LH5_NC);
-        lh5_fillbuf(d, (unsigned char)(d->c_len[j] - 12));
+        lh5_fillbuf(d, d->c_len[j]);
     }
     return j;
 }
 
 static unsigned short lh5_decode_p(struct lh5_dec *d)
 {
+    unsigned long e;
     unsigned short j;
-    unsigned short mask;
+    unsigned long mask;
+    unsigned int nbits;
 
-    j = d->pt_table[d->bitbuf >> (16 - 8)];
+    e = d->pt_table[d->bitbuf >> (LH5_BITBUF_BITS - 8)];
+    j = LH5_SYM(e);
     if (j < (unsigned short)d->np) {
-        lh5_fillbuf(d, d->pt_len[j]);
+        lh5_fillbuf(d, LH5_LEN(e));
     } else {
         lh5_fillbuf(d, 8);
-        mask = (unsigned short)(1 << (16 - 1));
+        mask = 1UL << (LH5_BITBUF_BITS - 1);
         do {
             if (d->bitbuf & mask) {
                 j = d->right[j];
             } else {
                 j = d->left[j];
             }
-            mask = (unsigned short)(mask >> 1);
+            mask >>= 1;
         } while (j >= (unsigned short)d->np);
-        lh5_fillbuf(d, (unsigned char)(d->pt_len[j] - 8));
+        lh5_fillbuf(d, d->pt_len[j]);
     }
     if (j != 0) {
-        j = (unsigned short)((1 << (j - 1)) + lh5_getbits(d, (unsigned char)(j - 1)));
+        nbits = (unsigned int)(j - 1);
+        j = (unsigned short)((1U << nbits) + lh5_getbits(d, nbits));
     }
     return j;
+}
+
+/*
+ * Expand one LZ match into out[].  History is prior output; bytes before
+ * offset 0 are the classic space (0x20) dictionary fill.  dist is the
+ * LHA position code (0 = previous byte).
+ */
+static void lh5_copy_match(
+    unsigned char *out,
+    unsigned long *count_io,
+    unsigned long outSize,
+    unsigned long dist,
+    unsigned long len)
+{
+    unsigned long count;
+    unsigned long rem;
+    unsigned long chunk;
+    unsigned long d;
+    long src;
+    unsigned char *dst;
+    unsigned char *sp;
+    unsigned char b;
+    unsigned long v;
+
+    count = *count_io;
+    d = dist + 1;
+
+    while (len != 0 && count < outSize) {
+        rem = outSize - count;
+        chunk = len;
+        if (chunk > rem) {
+            chunk = rem;
+        }
+
+        src = (long)count - (long)d;
+        dst = out + count;
+
+        if (src < 0) {
+            while (chunk != 0 && src < 0) {
+                *dst++ = 0x20;
+                src++;
+                chunk--;
+                len--;
+                count++;
+            }
+            if (chunk == 0) {
+                continue;
+            }
+        }
+
+        sp = out + (unsigned long)src;
+
+        if (d >= 4 && chunk >= 4) {
+            while (chunk != 0
+                && (((unsigned long)sp | (unsigned long)dst) & 3UL) != 0)
+            {
+                b = *sp++;
+                *dst++ = b;
+                chunk--;
+                len--;
+                count++;
+            }
+            while (chunk >= 4) {
+                v = *(unsigned long *)sp;
+                *(unsigned long *)dst = v;
+                sp += 4;
+                dst += 4;
+                chunk -= 4;
+                len -= 4;
+                count += 4;
+            }
+        }
+        while (chunk != 0) {
+            b = *sp++;
+            *dst++ = b;
+            chunk--;
+            len--;
+            count++;
+        }
+    }
+
+    *count_io = count;
 }
 
 /*
  * Shared LH4..LH7 / LHX decoder.  dicbit selects window size (2^dicbit);
  * pbit is the bit width used when reading the position-tree length count;
  * np is the number of position codes (usually dicbit+1; LHX uses 31).
+ *
+ * Match distance is still bounded by the method window; output goes
+ * straight to outBuf (no side ring).
  */
 static long lh_decompress_lh_new(
     void *inBuf,
@@ -357,19 +539,13 @@ static long lh_decompress_lh_new(
     unsigned int np)
 {
     struct lh5_dec *dec;
-    unsigned char *text;
     unsigned char *out;
     unsigned long dicsiz;
-    unsigned long dicsiz1;
     unsigned long count;
-    unsigned long loc;
-    unsigned long i;
-    unsigned long j;
-    unsigned long k;
     unsigned long c;
+    unsigned long j;
+    unsigned long dist;
     int offset;
-    unsigned char b;
-    long rc;
 
     if (!inBuf || !outBuf || inSize == 0 || outSize == 0) {
         return LH_ERR_INVALID_ARG;
@@ -382,13 +558,9 @@ static long lh_decompress_lh_new(
     }
 
     dicsiz = 1UL << dicbit;
-    text = (unsigned char *)malloc(dicsiz);
-    if (!text) {
-        return LH_ERR_NO_MEMORY;
-    }
+
     dec = (struct lh5_dec *)malloc(sizeof(*dec));
     if (!dec) {
-        free(text);
         return LH_ERR_NO_MEMORY;
     }
 
@@ -402,42 +574,27 @@ static long lh_decompress_lh_new(
     dec->pbit = (short)pbit;
     lh5_init_getbits(dec);
 
-    memset(text, ' ', dicsiz);
-    dicsiz1 = dicsiz - 1;
     offset = 0x100 - LH5_THRESHOLD;
     count = 0;
-    loc = 0;
     out = (unsigned char *)outBuf;
-    rc = LH_OK;
 
     while (count < outSize) {
         c = lh5_decode_c(dec);
         if (c <= UCHAR_MAX) {
-            text[loc++] = (unsigned char)c;
-            if (loc == dicsiz) {
-                loc = 0;
-            }
             out[count++] = (unsigned char)c;
         } else {
             j = c - (unsigned long)offset;
-            i = (loc - lh5_decode_p(dec) - 1) & dicsiz1;
-            for (k = 0; k < j; k++) {
-                b = text[(i + k) & dicsiz1];
-                text[loc++] = b;
-                if (loc == dicsiz) {
-                    loc = 0;
-                }
-                out[count++] = b;
-                if (count >= outSize) {
-                    break;
-                }
+            dist = lh5_decode_p(dec);
+            if (dist >= dicsiz) {
+                free(dec);
+                return LH_ERR_INVALID_ARCHIVE;
             }
+            lh5_copy_match(out, &count, outSize, dist, j);
         }
     }
 
     free(dec);
-    free(text);
-    return rc;
+    return LH_OK;
 }
 
 long lh_decompress_lh4(void *inBuf, unsigned long inSize, void *outBuf, unsigned long outSize)
@@ -462,6 +619,6 @@ long lh_decompress_lh7(void *inBuf, unsigned long inSize, void *outBuf, unsigned
 
 long lh_decompress_lhx(void *inBuf, unsigned long inSize, void *outBuf, unsigned long outSize)
 {
-    /* UNLHA32 -lhx-: 1 MiB ring, OFFSET_BITS=5 → up to 31 position codes. */
+    /* UNLHA32 -lhx-: 1 MiB window, OFFSET_BITS=5 → up to 31 position codes. */
     return lh_decompress_lh_new(inBuf, inSize, outBuf, outSize, 20, 5, 31);
 }
