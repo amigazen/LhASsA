@@ -12,11 +12,11 @@ This is **LhASsA** - an open source implementation of LhA as a system service fo
 
 *Minds awaken, free*
 
-**amigazen project** uses modern software development tools and methods to update and rerelease classic Amiga open source software. Projects include a new AWeb, ToolManager, Amiga Python 2, and the ToolKit project  -  a universal SDK for Amiga.
+**amigazen project** uses modern software development tools and methods to update and rerelease classic Amiga open source software. Projects include a new AWeb, Amiga Python 2, and the ToolKit project - a universal SDK for Amiga.
 
 Key to the amigazen project approach is ensuring every project can be built with the same common set of development tools and configurations, so the ToolKit project was created to provide a standard configuration for Amiga development. All *amigazen project* releases are guaranteed to build against the ToolKit standard so that anyone can download and begin contributing straightaway without having to tailor the toolchain for their own setup.
 
-Stefan Boberg, Jim Cooper, David Tritscher, and Sven Ottemann (authors of the classic Amiga LhA releases) are not affiliated with amigazen project. LhA was published as freeware/shareware for AmigaOS from 1991 onward; this tree is an independent reimplementation written from format documentation and reference behaviour, not a derivative of the original LhA sources.
+Stefan Boberg, Jim Cooper, David Tritscher, and Sven Ottemann (authors of the classic Amiga LhA releases) are not affiliated with amigazen project. LhA was published as freeware/shareware for AmigaOS from 1991 onward; this tree is an independent reimplementation written using archive format documentation, not a derivative of the original LhA sources or any other implementation.
 
 The amigazen project philosophy is based on openness:
 
@@ -30,80 +30,29 @@ LhASsA is distributed under the [BSD 2-Clause License](LICENSE.md).
 
 **LhA** (`.lzh` / `.lha`) is the de facto standard archive format on Amiga platforms from the late 1980s through the 1990s until today. Archives use level 0-2 headers, per-file CRC16 checks, and a family of **lh*** compression methods (lh0 store, lh1-lh7, lzs, lz4, lz5, and others).
 
-**LhASsA** (`lh.lib` + `lha` CLI + `lh.library`) recreates that format in pure **ANSI C (C89)** targeting especially vbcc on 68k AmigaOS but compatible with any recent C compiler on any platform. The `LhA` command included implements the same options as Amiga **LhA 2.15** : `a` adds files, `x` / `e` extract (with or without paths), `l` / `v` list. The library (`liblh.a`, public header `lh.h`) exposes read/write APIs for embedding LhArchive support in other programs.
+**LhASsA** is a brand new implementation of LhA for Amiga, providing not only a command line archiving tool, but a suite of services that integrate LhA archives as a first class component of the Amiga operating system. LhASsA includes a full set of system services, as well as an SDK, consisting of:
 
-**lh.library** implements LhArchive as a first class system object - retaining the original four buffer functions (`CreateBuffer`, `DeleteBuffer`, `LhEncode`, `LhDecode`) for backwards compatibility, but now enhanced with a rich API for creating, reading and updating LhA type archives.
+- **lh.library** - the core of LhASsA is lh.library providing archive management functions that mirror AmigaDOS file management functions, and a full set of highly optimised compression and decompression functions supporting all the major Lh algorithm variants.
+- **LhX** - a fast and lightweight Amiga-native command line tool for packing and unpacking LhA archives, that double as a Workbench DefaultTool for 
+- **lh-handler** - an overlay filesystem that allows for accessing LhA files as if they are directories __and__ within Workbench as virtual drawers
+- **LhA** - a command line option compatible version of the original LhA command, built standalone with lh.lib and written in cross platform C to allow compiling for Linux, Mac, Windows and any other platform
+- **lh.library legacy** - the new lh.library is backwards compatible to the original functions of 1991's LhLib.lha by Holger P Krekel and Olaf 'Olsen' Barthel from 1991
+- And a ToolKit SDK including:
+-- **lh.lib** - the static link library core for embedding in software without requiring the lh.library dependency
+-- **Autodocs & Includes** - a full set of developer documentation for LhASsA 
 
 ## Features
 
-- **LhA 2.15-compatible CLI**  -  same commands, options, and usage line as the classic Amiga archiver (`lha -<options> <command> <archive> ...`).
-- **Compress and decompress**  -  lh0 (store), lh1, lh5 (default), lh6, lh7; decompress lh0-lh7, lzs, lz4, lz5; `-z` store only; `-0`  -  `-3` select header level and method.
-- **Archive operations**  -  add, delete, concatenate, list (`l` / `v` / `vv`), test, print, extract (`x` / `e`).
-- **Header levels**  -  read level 0, 1, and 2 archives (including UNIX extension blocks); write level 0, 1, and 2 headers.
-- **Integrity**  -  16-bit CRC on stored data; extract and test report `BAD CRC` but continue through the archive.
-- **Progress output**  -  classic LhA-style console progress on extract and test (including `\r` byte counts and `Operation successful.`).
-- **Library**  -  `lh.lib` / `lh.h` static link library; `lh.library` shared runtime link library
-
-## Commands
-
-Enter `lha` with no arguments to print the built-in help (from `cli.txt`). Summary:
-
-| Cmd | Action |
-|-----|--------|
-| `a` | Add file(s) to archive |
-| `c` | Concatenate / append archive(s) into one |
-| `d` | Delete file(s) from archive |
-| `e` | Extract file(s) (names only) |
-| `f` | Freshen file(s) in archive |
-| `h` | Hunt for differences (archive vs filesystem) |
-| `l` / `lq` | List file(s), terse |
-| `m` | Move file(s) to archive |
-| `p` | Print file(s) to stdout |
-| `r` | Replace file(s) in archive |
-| `t` | Test file(s) in archive |
-| `u` | Update file(s) in archive |
-| `v` / `vq` | List file(s), verbose |
-| `vv` | List file(s), full detail |
-| `x` | Extract with full path |
-| `y` | Copy archive with new options |
-
-Common options include `-x` (preserve paths when adding/extracting), `-z` (store uncompressed), `-0` / `-1` / `-2` (header level), `-2` / `-3` (lh5 / lh6 compression), `w=<dir>` (work directory for extract), `-q` (quiet), `-n` / `-N` (suppress progress), and `o5` / `o6` / `o7` (select lh5 / lh6 / lh7 method). The destination directory for extract must end with `/` or `:`.
-
-### Examples
-
-```text
-lha a backup.lha Work:Sources/#?
-lha -x a project.lha Work:MyProject
-lha v project.lha
-lha x project.lha RAM:Out/
-lha t backup.lha
-lha c all.lha part1.lha part2.lha
-```
-
-Use `a` to create or append to an archive; do not use `c` for that (`c` is concatenate only).
-
-## Version and compatibility
-
-- **CLI banner:** `LhA LhASsA Version 2.15 68000`  -  command-line compatibility target for Amiga LhA 2.15.
-- **Format:** native `.lha` / `.lzh` only. Interchange with archives produced by LhA 2.15, LHa 1.14i, and common PC LHA tools is the design goal for supported methods and header levels.
+- **LhA 2.15-compatible** - LhASsA's new version of the LhA command itself offers the same commands, options, and console output format as the classic 2.15 version by Stefan Boberg
+- **All lh* variants** - Compress lh0 (store only), lh1, lh5 (default), lh6, lh7;  Decompress lh0-lh7, lzs, lz4, lz5
+- **Archive operations** - add, delete, concatenate, list (`l` / `v` / `vv`), test, print, extract (`x` / `e`).
+- **Compatible** - Unlike the Amiga original, LhaSsA can process LhA files with Unix and Microsoft Windows extensions and international character file names.
 
 ## Frequently Asked Questions
 
-### What is the difference between LhA, LhASsA, lh.lib and lh.library?
+### Does LhASsA's LhA command implement all classic LhA features?
 
-**LhA** refers to the classic archiver and `.lha` format family. **LhASsA** is the name for this reimplementation. The program presents the **LhA 2.15** banner on the command line to signal CLI compatibility. The portable engine is **liblh** (`liblh.a`, `lh.h`). **lh.library** is the AmigaOS shared-library packaging of that engine, replacing the 1990 lh.library with an LHA-native implementation.
-
-### Does LhASsA replace my old LhA executable?
-
-For normal `.lha` / `.lzh` archives, yes  -  use the same commands and options for the implemented subset. Some advanced commands and Amiga integration features are yet to be implemented and are currently no-ops (see below).
-
-### What about multi-volume archives?
-
-Not implemented. Classic LhA supported multivolume options (`-V`, `-Qv`); LhASsA handles single-file archives only.
-
-### What does LhASsA not implement from classic LhA?
-
-LhASsA targets **LHA format compatibility** and a **CLI-compatible front end**. Several LhA 2.15 features are omitted or only stubbed so existing scripts and help text keep working.
+LhASsA targets **LHA format compatibility** and the LhA compatible front end does currently omit several LhA 2.15 features.
 
 **Commands not yet implemented**
 
