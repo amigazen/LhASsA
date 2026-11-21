@@ -9,7 +9,7 @@ LD      = slink
 RM      = delete force quiet
 
 TARGET  = Handle
-OBJS    = handle.o handle_walk.o handle_ver.o handle_variant.o handle_manifest.o
+OBJS    = handle.o handle_walk.o handle_ver.o handle_variant.o handle_manifest.o handle_parts_info.o lhasa_cmdhelp.o
 
 all: $(TARGET)
 
@@ -18,7 +18,7 @@ rebuild: clean all
 $(TARGET): $(OBJS)
 	$(LD) FROM sc:lib/c.o $(OBJS) TO $(TARGET) STRIPDEBUG NODEBUG LIB lib:small.lib sc:lib/sc.lib BATCH
 
-handle.o: handle.c handle_internal.h
+handle.o: handle.c handle_internal.h /common/lhasa_cmdhelp.h
 	$(CC) DEF=AMIGA handle.c OBJNAME=handle.o
 
 handle_walk.o: handle_walk.c handle_internal.h
@@ -32,6 +32,12 @@ handle_variant.o: handle_variant.c handle_internal.h
 
 handle_manifest.o: handle_manifest.c handle_internal.h
 	$(CC) DEF=AMIGA handle_manifest.c OBJNAME=handle_manifest.o
+
+handle_parts_info.o: handle_parts_info.c
+	$(CC) DEF=AMIGA handle_parts_info.c OBJNAME=handle_parts_info.o
+
+lhasa_cmdhelp.o: /common/lhasa_cmdhelp.c /common/lhasa_cmdhelp.h
+	$(CC) DEF=AMIGA /common/lhasa_cmdhelp.c OBJNAME=lhasa_cmdhelp.o
 
 clean:
 	-$(RM) $(OBJS)

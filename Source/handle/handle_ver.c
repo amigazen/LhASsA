@@ -5,7 +5,7 @@
  *
  * handle_ver.c - Scan Amiga $VER: tags for Manifest Version generation.
  *
- * Canonical form (see ../../../../version.txt — AmigaMail 2.0):
+ * Canonical form (see ////version.txt — AmigaMail 2.0):
  *   $VER: name major.minor (dd.mm.yy)
  * Date separators may be '.' or '/' (e.g. (20.3.91) or (20/3/91)).
  * Missing or unparseable $VER: is a hard failure (scan returns 0).
@@ -240,7 +240,7 @@ LONG handle_ver_scan_file(STRPTR path, struct HandleVerInfo *vi)
         if (r == 0 && keep == 0) {
             break;
         }
-        r += keep;
+        r = r + keep;
         for (i = 0; i + 5 <= r; i++) {
             if (buf[i] == '$' && buf[i + 1] == 'V' && buf[i + 2] == 'E'
                 && buf[i + 3] == 'R' && buf[i + 4] == ':') {
@@ -266,14 +266,17 @@ LONG handle_ver_scan_file(STRPTR path, struct HandleVerInfo *vi)
         if (found) {
             break;
         }
-        if (r == 0) {
+        /* EOF with only the keep window left -- do not loop forever. */
+        if (r == keep) {
             break;
         }
         keep = 4;
         if (keep > r) {
             keep = r;
         }
-        CopyMem(buf + r - keep, buf, (ULONG)keep);
+        if (keep > 0) {
+            CopyMem(buf + r - keep, buf, (ULONG)keep);
+        }
     }
     FreeMem(buf, HANDLE_VER_BUF + 8);
     Close(fh);

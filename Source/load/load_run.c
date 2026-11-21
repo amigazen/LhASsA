@@ -24,6 +24,19 @@ extern struct DosLibrary *DOSBase;
 extern struct Library *UtilityBase;
 extern struct Library *LhBase;
 
+/* Set for the duration of load_run so load_print_error can raise a requester. */
+static ULONG load_run_interactive = 0;
+static ULONG load_run_verbose = 0;
+
+void load_log(STRPTR msg)
+{
+    if (!load_run_verbose || !msg) {
+        return;
+    }
+    Printf("Load: %s\n", (LONG)msg);
+    Flush(Output());
+}
+
 #ifndef AFF_68020
 #define AFF_68020 (1L << 1)
 #endif
@@ -51,22 +64,22 @@ void load_print_error(STRPTR msg, LONG code)
     if (!msg) {
         return;
     }
-    if (code) {
-        Printf("Load: %s (IoErr %ld)\n", (LONG)msg, code);
+    if (!load_run_interactive) {
+        if (code) {
+            Printf("Load: %s (IoErr %ld)\n", (LONG)msg, code);
+        } else {
+            Printf("Load: %s\n", (LONG)msg);
+        }
+        Flush(Output());
     } else {
-        Printf("Load: %s\n", (LONG)msg);
+        load_wb_error(msg, code);
     }
-    Flush(Output());
 }
 
 void load_print_usage(void)
 {
-    Printf("Load BIN=archive.lha [TO=dir] [FORCE] [QUIET]\n", 0);
-    Printf("Load ROLLBACK DEST=path [QUIET]\n", 0);
-    Printf("  Install a Bin via Manifest File: map (CPU/FPU/MMU/WOS/PUP).\n", 0);
-    Printf("  OS: checks exec.library; Requires: must be present.\n", 0);
-    Printf("  $VER: gates upgrades; bak copies live under SYS:T/Load.\n", 0);
-    Printf("  TO= relocates relative destinations only; LIBS:/C: stay fixed.\n", 0);
+    /* Never dump a short synopsis; full text is Load HELP (.help file). */
+    Printf("Load: type Load HELP for documentation.\n", 0);
     Flush(Output());
 }
 
@@ -147,14 +160,14 @@ LONG load_resolve_dest(STRPTR out, LONG outlen, STRPTR dest,
             break;
         }
         j = 0;
-        while (dest[i] != '\0' && dest[i] != '/' && j < (LONG)sizeof(seg) - 1) {
+        while (dest[i] != '\0' && dest[i] != '/' && j < LOAD_VAL_LEN - 1) {
             seg[j++] = dest[i++];
         }
         seg[j] = '\0';
         if (seg[0] == '\0') {
             continue;
         }
-        if (!AddPart(out, seg, (ULONG)outlen)) {
+        if (!AddPart(out, (STRPTR)seg, (ULONG)outlen)) {
             return 0;
         }
     }
@@ -489,6 +502,7 @@ static LONG load_parse_file_line(STRPTR line, struct LoadFileVar *out)
 {
     STRPTR p;
     char tok[LOAD_VAL_LEN];
+    struct LoadVerInfo vi;
 
     out->dest[0] = '\0';
     out->from[0] = '\0';
@@ -499,6 +513,11 @@ static LONG load_parse_file_line(STRPTR line, struct LoadFileVar *out)
     out->wos = 0;
     out->pup = 0;
     out->selected = 0;
+    out->have_ver = 0;
+    out->have_date = 0;
+    out->ver_major = 0;
+    out->ver_minor = 0;
+    out->ver_ymd = 0;
 
     p = line;
     load_skip_ws(&p);
@@ -516,28 +535,36 @@ static LONG load_parse_file_line(STRPTR line, struct LoadFileVar *out)
         if (*p == '\0' || *p == '#' || *p == '\r' || *p == '\n') {
             break;
         }
-        if (!load_copy_token(tok, LOAD_VAL_LEN, &p)) {
+        if (!load_copy_token((STRPTR)tok, LOAD_VAL_LEN, &p)) {
             break;
         }
-        if (Strnicmp(tok, (STRPTR)"From=", 5) == 0) {
-            Strncpy(out->from, tok + 5, LOAD_VAL_LEN);
-        } else if (Strnicmp(tok, (STRPTR)"CPU=", 4) == 0) {
-            Strncpy(out->cpu, tok + 4, (LONG)sizeof(out->cpu));
+        if (Strnicmp((STRPTR)tok, (STRPTR)"From=", 5) == 0) {
+            Strncpy(out->from, (STRPTR)(tok + 5), LOAD_VAL_LEN);
+        } else if (Strnicmp((STRPTR)tok, (STRPTR)"CPU=", 4) == 0) {
+            Strncpy(out->cpu, (STRPTR)(tok + 4), (LONG)sizeof(out->cpu));
             if (Stricmp(out->cpu, (STRPTR)"wos") == 0) {
                 out->wos = 1;
             } else if (Stricmp(out->cpu, (STRPTR)"pup") == 0) {
                 out->pup = 1;
             }
-        } else if (Strnicmp(tok, (STRPTR)"FPU=", 4) == 0) {
-            if (Stricmp(tok + 4, (STRPTR)"882") == 0) {
+        } else if (Strnicmp((STRPTR)tok, (STRPTR)"FPU=", 4) == 0) {
+            if (Stricmp((STRPTR)(tok + 4), (STRPTR)"882") == 0) {
                 out->fpu882 = 1;
                 out->fpu881 = 1;
-            } else if (Stricmp(tok + 4, (STRPTR)"881") == 0) {
+            } else if (Stricmp((STRPTR)(tok + 4), (STRPTR)"881") == 0) {
                 out->fpu881 = 1;
             }
-        } else if (Strnicmp(tok, (STRPTR)"MMU=", 4) == 0) {
-            if (tok[4] == '1' || Stricmp(tok + 4, (STRPTR)"yes") == 0) {
+        } else if (Strnicmp((STRPTR)tok, (STRPTR)"MMU=", 4) == 0) {
+            if (tok[4] == '1' || Stricmp((STRPTR)(tok + 4), (STRPTR)"yes") == 0) {
                 out->mmu = 1;
+            }
+        } else if (Strnicmp((STRPTR)tok, (STRPTR)"Ver=", 4) == 0) {
+            if (load_ver_parse_short((STRPTR)(tok + 4), &vi) && vi.have_ver) {
+                out->have_ver = 1;
+                out->have_date = vi.have_date;
+                out->ver_major = vi.major;
+                out->ver_minor = vi.minor;
+                out->ver_ymd = vi.ymd;
             }
         }
     }
@@ -575,13 +602,13 @@ static LONG load_parse_requires_line(STRPTR line, struct LoadRequire *out)
         if (*p == '\0' || *p == '#' || *p == '\r' || *p == '\n') {
             break;
         }
-        if (!load_copy_token(tok, LOAD_VAL_LEN, &p)) {
+        if (!load_copy_token((STRPTR)tok, LOAD_VAL_LEN, &p)) {
             break;
         }
-        if (Strnicmp(tok, (STRPTR)"Min=", 4) == 0) {
-            Strncpy(out->minver, tok + 4, (LONG)sizeof(out->minver));
-        } else if (Strnicmp(tok, (STRPTR)"URL=", 4) == 0) {
-            Strncpy(out->url, tok + 4, LOAD_VAL_LEN);
+        if (Strnicmp((STRPTR)tok, (STRPTR)"Min=", 4) == 0) {
+            Strncpy(out->minver, (STRPTR)(tok + 4), (LONG)sizeof(out->minver));
+        } else if (Strnicmp((STRPTR)tok, (STRPTR)"URL=", 4) == 0) {
+            Strncpy(out->url, (STRPTR)(tok + 4), LOAD_VAL_LEN);
         }
     }
     return 1;
@@ -626,14 +653,33 @@ LONG load_parse_manifest(STRPTR text, LONG len, struct LoadManifest *man)
 {
     LONG i;
     LONG start;
-    char line[512];
-    char key[LOAD_KEY_LEN];
-    char val[LOAD_VAL_LEN];
+    STRPTR line;
+    STRPTR key;
+    STRPTR val;
+    struct LoadFileVar *fv;
+    struct LoadRequire *req;
     LONG llen;
-    struct LoadFileVar fv;
-    struct LoadRequire req;
+    LONG ok;
 
     if (!text || !man || len < 0) {
+        return 0;
+    }
+
+    /*
+     * Parse workspace (line + key + val + fv + req) is ~1.9KB together --
+     * too large for the 4K stack; keep on the heap.
+     */
+    line = (STRPTR)load_alloc(512);
+    key  = (STRPTR)load_alloc(LOAD_KEY_LEN);
+    val  = (STRPTR)load_alloc(LOAD_VAL_LEN);
+    fv   = (struct LoadFileVar *)load_alloc((ULONG)sizeof(struct LoadFileVar));
+    req  = (struct LoadRequire *)load_alloc((ULONG)sizeof(struct LoadRequire));
+    if (!line || !key || !val || !fv || !req) {
+        load_free(line, 512);
+        load_free(key, LOAD_KEY_LEN);
+        load_free(val, LOAD_VAL_LEN);
+        load_free(fv, (ULONG)sizeof(struct LoadFileVar));
+        load_free(req, (ULONG)sizeof(struct LoadRequire));
         return 0;
     }
 
@@ -643,6 +689,7 @@ LONG load_parse_manifest(STRPTR text, LONG len, struct LoadManifest *man)
     Strncpy(man->install_root, (STRPTR)"Work:", LOAD_VAL_LEN);
     man->nfiles = 0;
     man->nreqs = 0;
+    ok = 1;
 
     i = 0;
     while (i < len) {
@@ -651,8 +698,8 @@ LONG load_parse_manifest(STRPTR text, LONG len, struct LoadManifest *man)
             i++;
         }
         llen = i - start;
-        if (llen >= (LONG)sizeof(line)) {
-            llen = (LONG)sizeof(line) - 1;
+        if (llen >= 512) {
+            llen = 511;
         }
         if (llen > 0) {
             CopyMem(text + start, line, (ULONG)llen);
@@ -673,26 +720,30 @@ LONG load_parse_manifest(STRPTR text, LONG len, struct LoadManifest *man)
             if (Strnicmp(lp, (STRPTR)"File:", 5) == 0) {
                 if (man->nfiles >= LOAD_MAX_FILES) {
                     load_print_error((STRPTR)"too many File: lines", 0);
-                    return 0;
+                    ok = 0;
+                    break;
                 }
-                if (!load_parse_file_line(lp, &fv)) {
+                if (!load_parse_file_line(lp, fv)) {
                     load_print_error((STRPTR)"bad File: line", 0);
-                    return 0;
+                    ok = 0;
+                    break;
                 }
-                man->files[man->nfiles] = fv;
+                man->files[man->nfiles] = *fv;
                 man->nfiles++;
                 continue;
             }
             if (Strnicmp(lp, (STRPTR)"Requires:", 9) == 0) {
                 if (man->nreqs >= LOAD_MAX_REQS) {
                     load_print_error((STRPTR)"too many Requires: lines", 0);
-                    return 0;
+                    ok = 0;
+                    break;
                 }
-                if (!load_parse_requires_line(lp, &req)) {
+                if (!load_parse_requires_line(lp, req)) {
                     load_print_error((STRPTR)"bad Requires: line", 0);
-                    return 0;
+                    ok = 0;
+                    break;
                 }
-                man->reqs[man->nreqs] = req;
+                man->reqs[man->nreqs] = *req;
                 man->nreqs++;
                 continue;
             }
@@ -709,7 +760,13 @@ LONG load_parse_manifest(STRPTR text, LONG len, struct LoadManifest *man)
             }
         }
     }
-    return 1;
+
+    load_free(line, 512);
+    load_free(key, LOAD_KEY_LEN);
+    load_free(val, LOAD_VAL_LEN);
+    load_free(fv, (ULONG)sizeof(struct LoadFileVar));
+    load_free(req, (ULONG)sizeof(struct LoadRequire));
+    return ok;
 }
 
 static LONG load_dest_exists(STRPTR path)
@@ -724,174 +781,399 @@ static LONG load_dest_exists(STRPTR path)
     return 0;
 }
 
-/*
- * Install one selected archive member with $VER gate and atomic place.
- * Returns: 1 ok, 0 fail, 2 skipped (not newer).
- */
-static LONG load_install_one(struct LhArchive *arc, STRPTR from, STRPTR dest,
-    struct LoadArgs *args, STRPTR man_version)
-{
-    APTR data;
-    LONG len;
-    UWORD expect_crc;
+/* One member extracted to SYS:T/Load, ready to place after archive close. */
+struct LoadStaged {
+    char dest[LOAD_PATH_LEN];
+    char from[LOAD_VAL_LEN];
     char cand[LOAD_PATH_LEN];
     char token[LOAD_TOKEN_LEN];
     char bak[LOAD_PATH_LEN];
+    UWORD crc;
+    LONG have_bak;
+    LONG skip;
+    LONG is_lh_lib;
+    LONG committed; /* 1 after successful place; used by abort */
+};
+
+/*
+ * Drop SYS:T/Load artefacts for one staged entry.  Dest is not touched
+ * (caller restores committed dests first when aborting a transaction).
+ */
+static void load_discard_staged(struct LoadStaged *st)
+{
+    char side[LOAD_PATH_LEN];
+
+    if (!st) {
+        return;
+    }
+    if (st->cand[0]) {
+        DeleteFile(st->cand);
+        st->cand[0] = '\0';
+    }
+    if (st->have_bak && st->bak[0]) {
+        DeleteFile(st->bak);
+        st->bak[0] = '\0';
+        if (st->token[0]) {
+            side[0] = '\0';
+            if (load_sidecar_path((STRPTR)side, LOAD_PATH_LEN, st->token)) {
+                DeleteFile((STRPTR)side);
+            }
+        }
+        st->have_bak = 0;
+    }
+}
+
+/*
+ * Undo a successful place: restore from bak when we had a prior file,
+ * otherwise delete the newly installed dest.
+ */
+static LONG load_uncommit_staged(struct LoadStaged *st)
+{
+    if (!st || st->skip || !st->committed) {
+        return 1;
+    }
+    if (st->have_bak && st->bak[0]) {
+        if (load_dest_exists(st->dest)) {
+            if (!load_clear_write_protect(st->dest)) {
+                return 0;
+            }
+            if (!DeleteFile(st->dest)) {
+                return 0;
+            }
+        }
+        if (!load_copy_file(st->bak, st->dest)) {
+            return 0;
+        }
+    } else if (st->dest[0] && load_dest_exists(st->dest)) {
+        if (!load_clear_write_protect(st->dest)) {
+            return 0;
+        }
+        if (!DeleteFile(st->dest)) {
+            return 0;
+        }
+    }
+    st->committed = 0;
+    return 1;
+}
+
+/*
+ * Abort an install transaction using per-entry committed flags (lh.library
+ * may have been placed out of order).  Reverse committed places latest-first,
+ * then discard uncommitted T: candidates.  On restore failure, or for
+ * lh.library, keep bak+sidecar so ROLLBACK / open-recovery can finish.
+ */
+static void load_abort_install(struct LoadStaged *staged, LONG nstaged)
+{
+    LONG i;
+    LONG ok;
+
+    if (!staged || nstaged <= 0) {
+        return;
+    }
+    load_log((STRPTR)"abort: rolling back transaction");
+
+    /* Undo successful places from the end of the table backwards. */
+    for (i = nstaged - 1; i >= 0; i--) {
+        if (!staged[i].committed) {
+            continue;
+        }
+        ok = load_uncommit_staged(&staged[i]);
+        if (!ok) {
+            load_print_error(
+                (STRPTR)"abort: could not restore; bak kept for ROLLBACK",
+                0);
+            if (staged[i].dest[0]) {
+                Printf("Load:   DEST=%s\n", (LONG)staged[i].dest);
+                Flush(Output());
+            }
+            if (staged[i].cand[0]) {
+                DeleteFile(staged[i].cand);
+                staged[i].cand[0] = '\0';
+            }
+            continue;
+        }
+        if (staged[i].is_lh_lib && staged[i].have_bak) {
+            if (staged[i].cand[0]) {
+                DeleteFile(staged[i].cand);
+                staged[i].cand[0] = '\0';
+            }
+            continue;
+        }
+        load_discard_staged(&staged[i]);
+    }
+
+    /* Drop uncommitted candidates; keep bak when dest missing or lh. */
+    for (i = 0; i < nstaged; i++) {
+        if (staged[i].committed) {
+            continue;
+        }
+        if (staged[i].cand[0]) {
+            DeleteFile(staged[i].cand);
+            staged[i].cand[0] = '\0';
+        }
+        if (staged[i].is_lh_lib && staged[i].have_bak && staged[i].bak[0]) {
+            load_log((STRPTR)"abort: keeping lh.library bak");
+            continue;
+        }
+        if (staged[i].have_bak && staged[i].bak[0]
+            && staged[i].dest[0] && !load_dest_exists(staged[i].dest)) {
+            load_print_error(
+                (STRPTR)"abort: dest missing; bak kept for ROLLBACK", 0);
+            Printf("Load:   DEST=%s\n", (LONG)staged[i].dest);
+            Flush(Output());
+            continue;
+        }
+        load_discard_staged(&staged[i]);
+    }
+}
+
+/*
+ * Extract one member to T: and apply skip rules.  Does not place yet
+ * so lh.library can be closed/flushed after all archive I/O is done.
+ * Prefer Manifest File: Ver= (from Handle) for the candidate version;
+ * after extract, optionally double-check the real $VER: matches.
+ * Returns: 1 staged, 0 fail (no T: leftovers), 2 skipped (cand deleted).
+ */
+static LONG load_stage_one(struct LhArchive *arc, struct LoadFileVar *fv,
+    STRPTR dest, struct LoadArgs *args, struct LoadStaged *out)
+{
     struct LoadVerInfo cand_ver;
     struct LoadVerInfo inst_ver;
-    ULONG man_maj;
-    ULONG man_min;
+    struct LoadVerInfo got_ver;
     int cmp;
-    LONG have_bak;
+    LONG vrc;
+    LONG has_ver;
+    char leaf[16];
+    LONG i;
+    UWORD crc;
+    STRPTR from;
+
+    if (!out || !fv) {
+        return 0;
+    }
+    from = fv->from;
+    out->dest[0] = '\0';
+    out->from[0] = '\0';
+    out->cand[0] = '\0';
+    out->token[0] = '\0';
+    out->bak[0] = '\0';
+    out->crc = 0;
+    out->have_bak = 0;
+    out->skip = 0;
+    out->is_lh_lib = 0;
+    out->committed = 0;
 
     if (load_path_is_volume_root(dest)) {
         load_print_error((STRPTR)"refusing to extract onto a volume root", 0);
         return 0;
     }
 
-    len = LhReadData(arc, from, &data);
-    if (len < 0 || !data) {
-        load_print_error((STRPTR)"cannot read archive member", LhErr());
+    Strncpy(out->dest, dest, LOAD_PATH_LEN);
+    Strncpy(out->from, from, LOAD_VAL_LEN);
+    out->is_lh_lib = load_dest_is_lh_library(dest);
+
+    /*
+     * Extract straight to T: -- never LhReadData whole libraries into RAM
+     * (that exhausted memory early on and left the OS unable to LoadSeg
+     * any further libraries).
+     */
+    if (!load_ensure_tdir()) {
+        load_print_error((STRPTR)"cannot create SYS:T/Load", IoErr());
+        return 0;
+    }
+    if (!load_alloc_token(out->token, LOAD_TOKEN_LEN)) {
+        load_print_error((STRPTR)"cannot allocate SYS:T/Load token", 0);
+        return 0;
+    }
+    leaf[0] = 'L';
+    leaf[1] = 'H';
+    leaf[2] = 'c';
+    for (i = 0; out->token[i] != '\0' && i < 8; i++) {
+        leaf[3 + i] = out->token[i];
+    }
+    leaf[3 + i] = '\0';
+    Strncpy(out->cand, (STRPTR)LOAD_TDIR, LOAD_PATH_LEN);
+    if (!AddPart(out->cand, (STRPTR)leaf, LOAD_PATH_LEN)) {
+        out->cand[0] = '\0';
+        return 0;
+    }
+    DeleteFile(out->cand);
+    if (!LhExtractEntry(arc, from, out->cand)) {
+        out->cand[0] = '\0';
+        load_print_error((STRPTR)"cannot extract archive member", LhErr());
         Printf("Load:   %s\n", (LONG)from);
         Flush(Output());
         return 0;
     }
-    expect_crc = load_crc16_buf(data, len);
-
-    if (!load_ensure_tdir()) {
-        FreeMem(data, (ULONG)len);
-        load_print_error((STRPTR)"cannot create SYS:T/Load", IoErr());
+    if (!load_crc16_file(out->cand, &crc)) {
+        load_discard_staged(out);
+        load_print_error((STRPTR)"cannot CRC candidate", IoErr());
         return 0;
     }
-    if (!load_alloc_token((STRPTR)token, LOAD_TOKEN_LEN)) {
-        FreeMem(data, (ULONG)len);
-        load_print_error((STRPTR)"cannot allocate SYS:T/Load token", 0);
-        return 0;
-    }
-    /* Candidate uses LHc + token (c = candidate). */
-    {
-        char leaf[16];
-        LONG i;
+    out->crc = crc;
 
-        leaf[0] = 'L';
-        leaf[1] = 'H';
-        leaf[2] = 'c';
-        for (i = 0; token[i] != '\0' && i < 8; i++) {
-            leaf[3 + i] = token[i];
-        }
-        leaf[3 + i] = '\0';
-        Strncpy((STRPTR)cand, (STRPTR)LOAD_TDIR, LOAD_PATH_LEN);
-        if (!AddPart((STRPTR)cand, (STRPTR)leaf, LOAD_PATH_LEN)) {
-            FreeMem(data, (ULONG)len);
-            return 0;
-        }
-    }
-    if (!load_write_file((STRPTR)cand, data, len)) {
-        FreeMem(data, (ULONG)len);
-        load_print_error((STRPTR)"cannot write candidate", IoErr());
-        return 0;
-    }
-    FreeMem(data, (ULONG)len);
-    data = NULL;
-
-    {
-        LONG vrc;
-
-        vrc = load_ver_scan_file((STRPTR)cand, &cand_ver);
-        if (vrc == 1 && cand_ver.have_ver) {
-            /* ok */
-        } else {
-            DeleteFile((STRPTR)cand);
-            if (vrc < 0) {
-                load_print_error((STRPTR)"candidate has no $VER: tag", 0);
-            } else {
+    /*
+     * Per-file upgrade gate against the installed copy only.
+     * Prefer Manifest File: Ver= written by Handle (staged $VER).
+     * After extract, double-check the candidate $VER: matches Ver= when
+     * both are present -- mismatch means a corrupt/wrong Bin member.
+     *
+     * No Ver= (data/.help) -> size + CRC16(first/last 256 bytes).
+     */
+    load_ver_clear(&cand_ver);
+    has_ver = 0;
+    if (fv->have_ver) {
+        cand_ver.have_ver = 1;
+        cand_ver.have_date = fv->have_date;
+        cand_ver.major = fv->ver_major;
+        cand_ver.minor = fv->ver_minor;
+        cand_ver.ymd = fv->ver_ymd;
+        has_ver = 1;
+        /* Double-check extracted member against Manifest Ver=. */
+        vrc = load_ver_scan_file(out->cand, &got_ver);
+        if (vrc == 1 && got_ver.have_ver) {
+            if (got_ver.major != fv->ver_major
+                || got_ver.minor != fv->ver_minor) {
+                load_discard_staged(out);
                 load_print_error(
-                    (STRPTR)"candidate $VER: unparseable", 0);
-            }
-            Printf("Load:   %s (need $VER: name maj.min [(dd.mm.yy|dd/mm/yy)])\n",
-                (LONG)from);
-            Flush(Output());
-            return 0;
-        }
-    }
-    if (!man_version || !man_version[0]
-        || !load_ver_parse_dotted(man_version, &man_maj, &man_min)
-        || man_maj != cand_ver.major || man_min != cand_ver.minor) {
-        DeleteFile((STRPTR)cand);
-        load_print_error((STRPTR)"Manifest Version does not match $VER", 0);
-        Printf("Load:   Manifest %s vs $VER %ld.%ld\n",
-            (LONG)(man_version ? man_version : (STRPTR)"?"),
-            cand_ver.major, cand_ver.minor);
-        Flush(Output());
-        return 0;
-    }
-
-    have_bak = 0;
-    bak[0] = '\0';
-    if (load_dest_exists(dest)) {
-        {
-            LONG vrc;
-
-            vrc = load_ver_scan_file(dest, &inst_ver);
-            if (vrc == 0) {
-                DeleteFile((STRPTR)cand);
-                load_print_error(
-                    (STRPTR)"installed $VER: unparseable (fix file)",
+                    (STRPTR)"member $VER: does not match Manifest Ver=",
                     0);
-                Printf("Load:   %s\n", (LONG)dest);
+                Printf("Load:   %s\n", (LONG)from);
                 Flush(Output());
                 return 0;
             }
-            if (vrc < 0) {
-                /* No $VER on installed file: treat as older / empty. */
+            if (!cand_ver.have_date && got_ver.have_date) {
+                cand_ver.have_date = 1;
+                cand_ver.ymd = got_ver.ymd;
+            }
+        }
+    } else {
+        /*
+         * Older Bins without File: Ver= -- fall back to scanning the
+         * extracted candidate (already on T:, no extra extract).
+         */
+        vrc = load_ver_scan_file(out->cand, &cand_ver);
+        if (vrc == 1 && cand_ver.have_ver) {
+            has_ver = 1;
+        } else {
+            load_ver_clear(&cand_ver);
+        }
+    }
+
+    if (load_dest_exists(dest)) {
+        if (has_ver) {
+            vrc = load_ver_scan_file(dest, &inst_ver);
+            if (vrc != 1 || !inst_ver.have_ver) {
+                has_ver = 0;
                 load_ver_clear(&inst_ver);
+            } else {
+                cmp = load_ver_compare(&cand_ver, &inst_ver);
+                if (cmp < 0 && !args->force) {
+                    load_discard_staged(out);
+                    if (!args->quiet) {
+                        Printf("Load: skip older %s\n", (LONG)dest);
+                        Flush(Output());
+                    }
+                    out->skip = 1;
+                    return 2;
+                }
+                if (cmp == 0 && !args->force) {
+                    load_discard_staged(out);
+                    if (!args->quiet) {
+                        Printf("Load: skip same %s\n", (LONG)dest);
+                        Flush(Output());
+                    }
+                    out->skip = 1;
+                    return 2;
+                }
             }
         }
-        cmp = load_ver_compare(&cand_ver, &inst_ver);
-        if (cmp < 0 && !args->force) {
-            DeleteFile((STRPTR)cand);
-            if (!args->quiet) {
-                Printf("Load: skip older %s\n", (LONG)dest);
-                Flush(Output());
+        if (!has_ver) {
+            if (!args->force
+                && load_files_same_content(out->cand, dest)) {
+                load_discard_staged(out);
+                if (!args->quiet) {
+                    Printf("Load: skip same %s\n", (LONG)dest);
+                    Flush(Output());
+                }
+                out->skip = 1;
+                return 2;
             }
-            return 2;
         }
-        if (cmp == 0 && !args->force) {
-            DeleteFile((STRPTR)cand);
-            if (!args->quiet) {
-                Printf("Load: skip same %s\n", (LONG)dest);
-                Flush(Output());
-            }
-            return 2;
-        }
-        if (!load_backup_to_t(dest, (STRPTR)token, LOAD_TOKEN_LEN,
-                (STRPTR)bak, LOAD_PATH_LEN)) {
-            DeleteFile((STRPTR)cand);
-            load_print_error((STRPTR)"cannot backup existing file to SYS:T/Load",
+        /* Reuse out->token so LHc / LHb / LHk share one id. */
+        if (!load_backup_to_t(dest, out->token, LOAD_TOKEN_LEN,
+                out->bak, LOAD_PATH_LEN)) {
+            load_discard_staged(out);
+            load_print_error(
+                (STRPTR)"cannot backup existing file to SYS:T/Load",
                 IoErr());
             return 0;
         }
-        have_bak = 1;
+        out->have_bak = 1;
         if (!args->quiet) {
-            Printf("Load: bak %s\n", (LONG)bak);
+            Printf("Load: bak %s\n", (LONG)out->bak);
             Flush(Output());
         }
     }
+    return 1;
+}
+
+/*
+ * Place staged candidate FIRST, then soft-flush the resident copy.
+ * RemLibrary/RemDevice only run after the new file is on disk so a failed
+ * rem never leaves the system without a file.  Sets *reboot_out when the
+ * module is still resident after the flush attempt.
+ * Returns: 1 ok, 0 fail (this dest restored by load_place_file when possible).
+ */
+static LONG load_commit_one(struct LoadStaged *st, struct LoadArgs *args,
+    LONG *reboot_out)
+{
+    LONG need_reboot;
+
+    if (!st || st->skip) {
+        return 1;
+    }
+    need_reboot = 0;
+    st->committed = 0;
 
     if (!args->quiet) {
-        Printf("Load: %s -> %s\n", (LONG)from, (LONG)dest);
+        Printf("Load: %s -> %s\n", (LONG)st->from, (LONG)st->dest);
         Flush(Output());
     }
 
-    if (!load_place_file((STRPTR)cand, dest, expect_crc,
-            have_bak ? (STRPTR)bak : NULL)) {
-        DeleteFile((STRPTR)cand);
+    if (!load_place_file(st->cand, st->dest, st->crc,
+            st->have_bak ? st->bak : NULL)) {
+        /* Place failed; dest restored from bak when one existed. */
+        DeleteFile(st->cand);
+        st->cand[0] = '\0';
         return 0;
     }
-    DeleteFile((STRPTR)cand);
-    if (have_bak && !args->quiet) {
-        Printf("Load: rollback copy kept at %s\n", (LONG)bak);
+    DeleteFile(st->cand);
+    st->cand[0] = '\0';
+    st->committed = 1;
+    if (st->have_bak && !args->quiet) {
+        Printf("Load: rollback copy kept at %s\n", (LONG)st->bak);
         Flush(Output());
+    }
+
+    /*
+     * Disk has the new file.  Now try to drop the old resident copy so the
+     * next open picks it up.  If it stays resident, caller advises reboot.
+     */
+    if (st->is_lh_lib) {
+        load_log((STRPTR)"flushing lh.library after place");
+        if (load_release_lh_library()) {
+            need_reboot = 1;
+        }
+        if (!load_open_lh_library()) {
+            need_reboot = 1;
+        }
+    } else {
+        need_reboot = load_try_flush_resource(st->dest);
+    }
+
+    if (reboot_out && need_reboot) {
+        *reboot_out = 1;
     }
     return 1;
 }
@@ -939,134 +1221,362 @@ static void load_print_readme(struct LhArchive *arc, STRPTR pkg_name)
     FreeMem(data, (ULONG)len);
 }
 
-#define LOAD_SUMMARY_MAX 24
-#define LOAD_SUMMARY_LEN 128
-
 LONG load_run(struct LoadArgs *args)
 {
     struct LhArchive *arc;
     APTR man_data;
     LONG man_len;
-    struct LoadManifest man;
+    struct LoadManifest *man;
     LONG i;
     char dest[LOAD_PATH_LEN];
     LONG rc;
     LONG one;
-    char installed[LOAD_SUMMARY_MAX][LOAD_SUMMARY_LEN];
-    char skipped[LOAD_SUMMARY_MAX][LOAD_SUMMARY_LEN];
-    LONG ninst;
+    char *added;
+    char *updated;
+    char *skipped;
+    LONG nadded;
+    LONG nupdated;
     LONG nskip;
+    struct LoadStaged *staged;
+    LONG nstaged;
+    LONG ncommitted;
+    LONG need_reboot;
+    LONG reboot_flag;
+    LONG did_commit;
+    ULONG man_sz;
+    ULONG sum_sz;
 
-    ninst = 0;
+    nadded = 0;
+    nupdated = 0;
     nskip = 0;
-
-    if (args->rollback) {
-        if (!args->dest || !args->dest[0]) {
-            load_print_error((STRPTR)"ROLLBACK requires DEST", 0);
-            return RETURN_FAIL;
-        }
-        return load_rollback_dest(args->dest, args->quiet);
+    nstaged = 0;
+    ncommitted = 0;
+    need_reboot = 0;
+    did_commit = 0;
+    staged = NULL;
+    man = NULL;
+    added = NULL;
+    updated = NULL;
+    skipped = NULL;
+    arc = NULL;
+    man_data = NULL;
+    man_len = 0;
+    rc = RETURN_FAIL;
+    /*
+     * LoadManifest is ~90KB -- must NOT live on the stack ($STACK is 4K).
+     * Stack overflow here was crashing right after "preflight destinations".
+     */
+    man_sz = (ULONG)sizeof(struct LoadManifest);
+    sum_sz = (ULONG)LOAD_SUMMARY_MAX * (ULONG)LOAD_SUMMARY_LEN;
+    load_run_interactive = args->interactive ? 1UL : 0UL;
+    load_run_verbose = args->verbose ? 1UL : 0UL;
+    if (load_run_verbose && args->quiet) {
+        /* VERBOSE wins over QUIET for progress lines. */
+        args->quiet = 0;
     }
 
+    if (args->rollback) {
+        load_log((STRPTR)"ROLLBACK path");
+        if (!args->dest || !args->dest[0]) {
+            load_print_error((STRPTR)"ROLLBACK requires DEST", 0);
+            load_run_interactive = 0;
+            load_run_verbose = 0;
+            return RETURN_FAIL;
+        }
+        rc = load_rollback_dest(args->dest, args->quiet);
+        load_run_interactive = 0;
+        load_run_verbose = 0;
+        return rc;
+    }
+
+    load_log((STRPTR)"allocating Manifest / staging");
+    man = (struct LoadManifest *)AllocMem(man_sz, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!man) {
+        load_print_error((STRPTR)"out of memory for Manifest", 0);
+        goto fail;
+    }
+    added = (char *)AllocMem(sum_sz, MEMF_PUBLIC | MEMF_CLEAR);
+    updated = (char *)AllocMem(sum_sz, MEMF_PUBLIC | MEMF_CLEAR);
+    skipped = (char *)AllocMem(sum_sz, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!added || !updated || !skipped) {
+        load_print_error((STRPTR)"out of memory for summary", 0);
+        goto fail;
+    }
+    staged = (struct LoadStaged *)AllocMem(
+        (ULONG)sizeof(struct LoadStaged) * (ULONG)LOAD_MAX_FILES,
+        MEMF_PUBLIC | MEMF_CLEAR);
+    if (!staged) {
+        load_print_error((STRPTR)"out of memory for install staging", 0);
+        goto fail;
+    }
+
+    load_log((STRPTR)"opening Bin");
+    if (args->bin && args->bin[0]) {
+        load_log(args->bin);
+    }
     arc = LhOpenArchive(args->bin, LHARC_MODE_READ);
     if (!arc) {
         load_print_error((STRPTR)"cannot open Bin", LhErr());
-        return RETURN_FAIL;
+        goto fail;
     }
 
+    load_log((STRPTR)"reading Manifest");
     man_data = NULL;
     man_len = LhReadData(arc, (STRPTR)"Manifest", &man_data);
     if (man_len < 0 || !man_data) {
-        LhCloseArchive(arc);
         load_print_error((STRPTR)"cannot read Manifest", LhErr());
-        return RETURN_FAIL;
+        goto fail;
     }
 
-    if (!load_parse_manifest((STRPTR)man_data, man_len, &man)) {
-        FreeMem(man_data, (ULONG)man_len);
-        LhCloseArchive(arc);
-        return RETURN_FAIL;
+    load_log((STRPTR)"parsing Manifest");
+    if (!load_parse_manifest((STRPTR)man_data, man_len, man)) {
+        goto fail;
     }
     FreeMem(man_data, (ULONG)man_len);
     man_data = NULL;
+    man_len = 0;
 
     if (!args->quiet) {
-        if (man.name[0]) {
-            Printf("Load: package %s", (LONG)man.name);
-            if (man.version[0]) {
-                Printf(" %s", (LONG)man.version);
+        if (man->name[0]) {
+            Printf("Load: package %s", (LONG)man->name);
+            if (man->version[0]) {
+                Printf(" %s", (LONG)man->version);
             }
             Printf("\n", 0);
             Flush(Output());
         }
     }
 
-    if (man.nfiles == 0) {
-        LhCloseArchive(arc);
+    if (man->nfiles == 0) {
         load_print_error((STRPTR)"Manifest has no File: map", 0);
-        return RETURN_FAIL;
+        goto fail;
     }
 
-    if (!man.version[0]) {
-        LhCloseArchive(arc);
+    if (!man->version[0]) {
         load_print_error((STRPTR)"Manifest missing Version", 0);
-        return RETURN_FAIL;
+        goto fail;
     }
 
-    if (!load_check_deps(&man)) {
-        LhCloseArchive(arc);
-        return RETURN_FAIL;
+    load_log((STRPTR)"checking Requires / OS");
+    if (!load_check_deps(man)) {
+        goto fail;
     }
 
-    if (!load_select_variants(&man)) {
-        LhCloseArchive(arc);
-        return RETURN_FAIL;
+    load_log((STRPTR)"selecting CPU/FPU variants");
+    if (!load_select_variants(man)) {
+        goto fail;
     }
 
-    rc = RETURN_OK;
-    for (i = 0; i < man.nfiles; i++) {
-        if (!man.files[i].selected) {
+    load_log((STRPTR)"preflight destinations");
+    if (!load_preflight(man, args->to)) {
+        goto fail;
+    }
+
+    /*
+     * Workbench: show what will be installed (and previous $VER) and wait
+     * for confirmation before any bak or place.
+     */
+    if (args->interactive) {
+        load_log((STRPTR)"showing displayme / confirm requesters");
+        if (!load_wb_confirm_install(man, args->to, arc)) {
+            load_log((STRPTR)"user cancelled install");
+            rc = RETURN_OK;
+            goto cleanup;
+        }
+        load_log((STRPTR)"user confirmed install");
+    }
+
+    /*
+     * Phase 1: extract every selected member to SYS:T/Load while lh.library
+     * is still open.  Skip/bak decisions happen here.  Destinations are
+     * untouched until phase 2.
+     */
+    load_log((STRPTR)"phase 1: stage selected members to SYS:T/Load");
+    for (i = 0; i < man->nfiles; i++) {
+        if (!man->files[i].selected) {
             continue;
         }
-        if (!load_resolve_dest(dest, LOAD_PATH_LEN, man.files[i].dest,
-            args->to, man.install_root)) {
+        if (!load_resolve_dest(dest, LOAD_PATH_LEN, man->files[i].dest,
+            args->to, man->install_root)) {
             load_print_error((STRPTR)"cannot resolve destination", 0);
-            LhCloseArchive(arc);
-            return RETURN_FAIL;
+            goto fail_tx;
         }
-        one = load_install_one(arc, man.files[i].from, dest, args,
-            man.version);
+        if (nstaged >= LOAD_MAX_FILES) {
+            load_print_error((STRPTR)"too many files to stage", 0);
+            goto fail_tx;
+        }
+        load_log((STRPTR)"staging");
+        load_log(dest);
+        one = load_stage_one(arc, &man->files[i], dest, args,
+            &staged[nstaged]);
         if (one == 0) {
-            LhCloseArchive(arc);
-            return RETURN_FAIL;
+            goto fail_tx;
         }
         if (one == 2) {
+            load_log((STRPTR)"skipped (up-to-date or FORCE off)");
             if (nskip < LOAD_SUMMARY_MAX) {
-                Strncpy(skipped[nskip], dest, LOAD_SUMMARY_LEN);
+                Strncpy(skipped + nskip * LOAD_SUMMARY_LEN, dest,
+                    LOAD_SUMMARY_LEN);
                 nskip++;
             }
-        } else if (ninst < LOAD_SUMMARY_MAX) {
-            Strncpy(installed[ninst], dest, LOAD_SUMMARY_LEN);
-            ninst++;
+            continue;
+        }
+        nstaged++;
+    }
+
+    if (!args->quiet) {
+        load_print_readme(arc, man->name);
+    }
+
+    load_log((STRPTR)"closing Bin before commit");
+    LhCloseArchive(arc);
+    arc = NULL;
+
+    /*
+     * Phase 2: place every staged file, then RemLibrary/RemDevice.
+     * Disk is updated first; reboot is advised only when a flush left the
+     * old resident module in memory.
+     */
+    load_log((STRPTR)"phase 2: commit staged files");
+    for (i = 0; i < nstaged; i++) {
+        reboot_flag = 0;
+        load_log((STRPTR)"committing");
+        load_log(staged[i].dest);
+        if (!load_commit_one(&staged[i], args, &reboot_flag)) {
+            /*
+             * This dest was restored by load_place_file when possible.
+             * Reverse earlier successful places so the set stays atomic.
+             */
+            goto fail_tx;
+        }
+        ncommitted++;
+        if (reboot_flag) {
+            need_reboot = 1;
+        }
+        /*
+         * have_bak means dest existed before place => Updated; else Added.
+         */
+        if (staged[i].have_bak) {
+            if (nupdated < LOAD_SUMMARY_MAX) {
+                Strncpy(updated + nupdated * LOAD_SUMMARY_LEN,
+                    staged[i].dest, LOAD_SUMMARY_LEN);
+                nupdated++;
+            }
+        } else if (nadded < LOAD_SUMMARY_MAX) {
+            Strncpy(added + nadded * LOAD_SUMMARY_LEN, staged[i].dest,
+                LOAD_SUMMARY_LEN);
+            nadded++;
         }
     }
 
     if (!args->quiet) {
-        load_print_readme(arc, man.name);
         Printf("Load: summary\n", 0);
-        if (ninst == 0 && nskip == 0) {
+        if (nadded == 0 && nupdated == 0 && nskip == 0) {
             Printf("  (nothing selected)\n", 0);
         }
-        for (i = 0; i < ninst; i++) {
-            Printf("  installed  %s\n", (LONG)installed[i]);
+        for (i = 0; i < nadded; i++) {
+            Printf("  added      %s\n",
+                (LONG)(added + i * LOAD_SUMMARY_LEN));
+        }
+        for (i = 0; i < nupdated; i++) {
+            Printf("  updated    %s\n",
+                (LONG)(updated + i * LOAD_SUMMARY_LEN));
         }
         for (i = 0; i < nskip; i++) {
-            Printf("  skipped    %s\n", (LONG)skipped[i]);
+            Printf("  skipped    %s\n",
+                (LONG)(skipped + i * LOAD_SUMMARY_LEN));
         }
         Printf("Load: done\n", 0);
         Flush(Output());
     }
 
-    LhCloseArchive(arc);
+    if (args->interactive) {
+        load_wb_install_done(added, nadded, updated, nupdated, need_reboot);
+    }
+    if (need_reboot) {
+        load_log((STRPTR)"reboot recommended");
+        load_print_reboot_advice(args->quiet);
+        rc = RETURN_WARN;
+    } else {
+        load_log((STRPTR)"done");
+        rc = RETURN_OK;
+    }
+    goto cleanup;
+
+fail_tx:
+    /*
+     * Transaction failed after some staging and/or commits.  Roll back
+     * committed files and discard uncommitted T: candidates/baks.
+     */
+    did_commit = ncommitted;
+    load_abort_install(staged, nstaged);
+    ncommitted = 0;
+    nstaged = 0;
+    /*
+     * After abort, drop any in-memory lh handle (may be a post-place open
+     * of a file we just restored over) and reopen from disk / T: bak.
+     */
+    if (LhBase) {
+        CloseLibrary(LhBase);
+        LhBase = NULL;
+    }
+    if (!load_open_lh_library()) {
+        load_print_error(
+            (STRPTR)
+            "lh.library unavailable after abort; try "
+            "Load ROLLBACK DEST=LIBS:lh.library",
+            0);
+    }
+    /* Extra requester only when places were undone (stage errors already
+     * reported via load_print_error). */
+    if (args->interactive && did_commit > 0) {
+        load_wb_error(
+            (STRPTR)
+            "Install aborted; previous files restored where possible.",
+            0);
+    }
+    rc = RETURN_FAIL;
+    goto cleanup;
+
+fail:
+    rc = RETURN_FAIL;
+    /* fall through */
+
+cleanup:
+    if (man_data && man_len > 0) {
+        FreeMem(man_data, (ULONG)man_len);
+        man_data = NULL;
+    }
+    if (arc) {
+        LhCloseArchive(arc);
+        arc = NULL;
+    }
+    if (staged) {
+        /*
+         * Success path: leave bak/sidecar for ROLLBACK.  Failure paths
+         * already discarded via load_abort_install.
+         */
+        FreeMem(staged,
+            (ULONG)sizeof(struct LoadStaged) * (ULONG)LOAD_MAX_FILES);
+        staged = NULL;
+    }
+    if (added) {
+        FreeMem(added, sum_sz);
+        added = NULL;
+    }
+    if (updated) {
+        FreeMem(updated, sum_sz);
+        updated = NULL;
+    }
+    if (skipped) {
+        FreeMem(skipped, sum_sz);
+        skipped = NULL;
+    }
+    if (man) {
+        FreeMem(man, man_sz);
+        man = NULL;
+    }
+    load_run_interactive = 0;
+    load_run_verbose = 0;
     return rc;
 }

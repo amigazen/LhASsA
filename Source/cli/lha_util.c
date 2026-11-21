@@ -63,6 +63,164 @@ char *lha_basename(const char *path)
     return lha_strdup(b);
 }
 
+int lha_stricmp(const char *a, const char *b)
+{
+    unsigned char ca;
+    unsigned char cb;
+
+    if (!a && !b) {
+        return 0;
+    }
+    if (!a) {
+        return -1;
+    }
+    if (!b) {
+        return 1;
+    }
+    while (*a || *b) {
+        ca = (unsigned char)*a;
+        cb = (unsigned char)*b;
+        if (ca >= 'A' && ca <= 'Z') {
+            ca = (unsigned char)(ca - 'A' + 'a');
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (unsigned char)(cb - 'A' + 'a');
+        }
+        if (ca != cb) {
+            return (int)ca - (int)cb;
+        }
+        if (*a) {
+            a++;
+        }
+        if (*b) {
+            b++;
+        }
+    }
+    return 0;
+}
+
+/*
+ * True if pattern contains AmigaDOS / LhA wildcard tokens.
+ * -Qw forces false so specs are treated literally.
+ */
+int lha_path_is_wild(const char *pattern)
+{
+    const char *p;
+
+    if (g_opts.no_wildcards || !pattern) {
+        return 0;
+    }
+    for (p = pattern; *p != '\0'; p++) {
+        if (*p == '*' || *p == '?' || *p == '#' || *p == '['
+            || *p == '(' || *p == '~' || *p == '|') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void lha_free_paths(char **paths, int count)
+{
+    int i;
+
+    if (!paths) {
+        return;
+    }
+    for (i = 0; i < count; i++) {
+        free(paths[i]);
+    }
+    free(paths);
+}
+
+/*
+ * Expand filesystem patterns.  Non-wild entries are kept as given (so ADD
+ * can create a new archive name).  On non-Amiga hosts, wildcards are not
+ * expanded and are kept literally.
+ */
+char **lha_expand_paths(char **patterns, int count, int *out_count)
+{
+    char **out;
+    int i;
+
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!patterns || count <= 0) {
+        return NULL;
+    }
+#if defined(LHA_AMIGA)
+    if (!g_opts.no_wildcards) {
+        return lha_expand_paths_amiga(patterns, count, out_count);
+    }
+#endif
+    out = (char **)malloc((size_t)count * sizeof(char *));
+    if (!out) {
+        return NULL;
+    }
+    for (i = 0; i < count; i++) {
+        out[i] = lha_strdup(patterns[i] ? patterns[i] : "");
+        if (!out[i]) {
+            lha_free_paths(out, i);
+            return NULL;
+        }
+    }
+    if (out_count) {
+        *out_count = count;
+    }
+    return out;
+}
+
+/*
+ * Strip a leading volume (text up to and including first ':').
+ * Classic -x stores paths excluding the device specification.
+ */
+static const char *lha_strip_volume(const char *path)
+{
+    const char *p;
+
+    if (!path) {
+        return "";
+    }
+    for (p = path; *p != '\0'; p++) {
+        if (*p == ':') {
+            p++;
+            if (*p == '/') {
+                p++;
+            }
+            return p;
+        }
+    }
+    return path;
+}
+
+char *lha_make_arcname(const char *path)
+{
+    char disk[512];
+    const char *use;
+    int ok;
+
+    if (!path) {
+        return lha_strdup("");
+    }
+    ok = 0;
+#if defined(LHA_AMIGA)
+    ok = lha_disk_case_path_amiga(path, disk, sizeof(disk));
+#endif
+    if (!ok) {
+        strncpy(disk, path, sizeof(disk) - 1);
+        disk[sizeof(disk) - 1] = '\0';
+        lha_normalize_slashes(disk);
+    }
+    if (g_opts.preserve_paths > 0) {
+        use = lha_strip_volume(disk);
+        if (!use[0]) {
+            return lha_basename(disk);
+        }
+        return lha_strdup(use);
+    }
+    return lha_basename(disk);
+}
+
 int lha_path_join(char *out, size_t outsz, const char *dir, const char *name)
 {
     size_t dlen;
@@ -152,12 +310,129 @@ int lha_write_file(const char *path, const unsigned char *data, size_t len)
 #endif
 }
 
-int lha_match_pattern(const char *pattern, const char *name)
+/*
+ * Portable subset when AmigaDOS ParsePattern is unavailable: *, #?, ?,
+ * and case-insensitive exact match.  Also tries the leaf name.
+ */
+static int lha_match_pattern_simple(const char *pattern, const char *name)
 {
-    if (!pattern || !pattern[0] || strcmp(pattern, "*") == 0) {
+    const char *pp;
+    const char *np;
+    const char *leaf;
+
+    if (!pattern || !pattern[0]
+        || strcmp(pattern, "*") == 0
+        || (pattern[0] == '#' && pattern[1] == '?' && pattern[2] == '\0')) {
         return 1;
     }
-    return strcmp(pattern, name) == 0;
+    if (!name) {
+        return 0;
+    }
+    if (lha_stricmp(pattern, name) == 0) {
+        return 1;
+    }
+    leaf = name;
+    for (np = name; *np; np++) {
+        if (*np == '/' || *np == '\\' || *np == ':') {
+            leaf = np + 1;
+        }
+    }
+    if (leaf != name && lha_stricmp(pattern, leaf) == 0) {
+        return 1;
+    }
+
+    /* Simple * / ? glob against name and leaf. */
+    pp = pattern;
+    np = name;
+    for (;;) {
+        if (*pp == '\0') {
+            return *np == '\0';
+        }
+        if (*pp == '*') {
+            pp++;
+            if (*pp == '\0') {
+                return 1;
+            }
+            while (*np) {
+                if (lha_match_pattern_simple(pp, np)) {
+                    return 1;
+                }
+                np++;
+            }
+            return 0;
+        }
+        if (*np == '\0') {
+            return 0;
+        }
+        if (*pp == '?') {
+            pp++;
+            np++;
+            continue;
+        }
+        {
+            char ca;
+            char cb;
+
+            ca = *pp;
+            cb = *np;
+            if (ca >= 'A' && ca <= 'Z') {
+                ca = (char)(ca - 'A' + 'a');
+            }
+            if (cb >= 'A' && cb <= 'Z') {
+                cb = (char)(cb - 'A' + 'a');
+            }
+            if (ca != cb) {
+                return 0;
+            }
+        }
+        pp++;
+        np++;
+    }
+}
+
+int lha_match_pattern(const char *pattern, const char *name)
+{
+    const char *p;
+    const char *leaf;
+
+    if (g_opts.no_wildcards) {
+        if (!pattern || !pattern[0]) {
+            return 1;
+        }
+        if (!name) {
+            return 0;
+        }
+        if (lha_stricmp(pattern, name) == 0) {
+            return 1;
+        }
+        leaf = name;
+        for (p = name; *p != '\0'; p++) {
+            if (*p == '/' || *p == '\\' || *p == ':') {
+                leaf = p + 1;
+            }
+        }
+        return lha_stricmp(pattern, leaf) == 0;
+    }
+#if defined(LHA_AMIGA)
+    return lha_match_pattern_amiga(pattern, name);
+#else
+    if (lha_match_pattern_simple(pattern, name)) {
+        return 1;
+    }
+    if (!name) {
+        return 0;
+    }
+    leaf = name;
+    for (p = name; *p != '\0'; p++) {
+        if (*p == '/' || *p == '\\' || *p == ':') {
+            leaf = p + 1;
+        }
+    }
+    if (leaf != name) {
+        return lha_match_pattern_simple(pattern, leaf);
+    }
+    return 0;
+#endif
 }
 
 int lha_name_matches_any(const char *name, char **patterns, int count)
@@ -176,6 +451,103 @@ int lha_name_matches_any(const char *name, char **patterns, int count)
         }
     }
     return 0;
+}
+
+/*
+ * Load every member filename from archive (header-only).  Returns a
+ * malloc'd list; empty archives / missing files yield count 0 and NULL.
+ * Used by classic `a` duplicate skip before the writer is opened.
+ */
+char **lha_archive_member_names(const char *archive, int *out_count)
+{
+    lh_reader *r;
+    lh_entry entry;
+    lh_status st;
+    lh_status err;
+    char **names;
+    int n;
+    int cap;
+    char *copy;
+
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!archive) {
+        return NULL;
+    }
+    r = lh_reader_open(archive, &err);
+    if (!r) {
+        return NULL;
+    }
+    names = NULL;
+    n = 0;
+    cap = 0;
+    lh_reader_set_header_only(r, 1);
+    for (;;) {
+        memset(&entry, 0, sizeof(entry));
+        st = lh_reader_next(r, &entry);
+        if (st == LH_OK && !entry.filename) {
+            break;
+        }
+        if (st != LH_OK) {
+            lh_entry_clear(&entry);
+            break;
+        }
+        if (entry.filename && entry.filename[0]) {
+            if (n >= cap) {
+                char **grown;
+                int ncap;
+
+                ncap = (cap == 0) ? 16 : cap * 2;
+                grown = (char **)realloc(names,
+                    (size_t)ncap * sizeof(char *));
+                if (!grown) {
+                    lh_entry_clear(&entry);
+                    lh_reader_close(&r);
+                    lha_free_paths(names, n);
+                    return NULL;
+                }
+                names = grown;
+                cap = ncap;
+            }
+            copy = lha_strdup(entry.filename);
+            if (!copy) {
+                lh_entry_clear(&entry);
+                lh_reader_close(&r);
+                lha_free_paths(names, n);
+                return NULL;
+            }
+            names[n++] = copy;
+        }
+        lh_entry_clear(&entry);
+    }
+    lh_reader_close(&r);
+    if (out_count) {
+        *out_count = n;
+    }
+    return names;
+}
+
+int lha_archive_has_member(const char *archive, const char *name)
+{
+    char **names;
+    int n;
+    int i;
+    int found;
+
+    names = lha_archive_member_names(archive, &n);
+    if (!names) {
+        return 0;
+    }
+    found = 0;
+    for (i = 0; i < n; i++) {
+        if (lha_stricmp(names[i], name) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    lha_free_paths(names, n);
+    return found;
 }
 
 int lha_read_file(const char *path, unsigned char **data, size_t *len, lh_datetime *dt)
@@ -399,10 +771,28 @@ void lha_operation_failed(void)
 
 void lha_add_message(const char *name)
 {
+    lha_add_freeze_begin(name);
+}
+
+void lha_add_freeze_begin(const char *name)
+{
     if (!lha_show_messages() || !name) {
         return;
     }
-    fprintf(stdout, "ADD %s\n", name);
+    fprintf(stdout, " Freezing: %s\n", name);
+    fflush(stdout);
+}
+
+void lha_add_freeze_end(const char *name, int stored)
+{
+    if (!lha_show_messages() || !name) {
+        return;
+    }
+    if (stored) {
+        fprintf(stdout, " Frozen (store): %s\n", name);
+    } else {
+        fprintf(stdout, " Frozen: %s\n", name);
+    }
     fflush(stdout);
 }
 

@@ -8,6 +8,7 @@
 
 #include <exec/types.h>
 #include <exec/execbase.h>
+#include <exec/memory.h>
 #include <dos/dos.h>
 #include <dos/rdargs.h>
 #include <proto/exec.h>
@@ -20,6 +21,7 @@ struct Library *UtilityBase = NULL;
 #include <proto/lh.h>
 
 #include "lhx_internal.h"
+#include "/common/lhasa_cmdhelp.h"
 
 extern struct ExecBase *SysBase;
 extern struct DosLibrary *DOSBase;
@@ -27,7 +29,8 @@ extern struct DosLibrary *DOSBase;
 struct Library *LhBase = NULL;
 
 static const char *verstag = "$VER: LhX 1.0 (02.07.2026)\n";
-static const char *stack_cookie = "$STACK: 8096\n";
+/* 4K -- LhxArgs and recursive walk frames are heap-allocated. */
+static const char *stack_cookie = "$STACK: 4096\n";
 const long oslibversion = 37L;
 
 #define LHX_NARGS 14
@@ -40,7 +43,7 @@ static const char *TEMPLATE =
     "T=TEST/S,"
     "PRINT/S,"
     "HELP/S,"
-    "ARCHIVE/A,"
+    "ARCHIVE,"
     "FILES/M,"
     "TO/K,"
     "QUIET/S,"
@@ -196,12 +199,18 @@ static int lhx_open_libs(void)
 int main(int argc, char *argv[])
 {
     struct RDArgs *rda;
-    struct LhxArgs args;
+    struct LhxArgs *args;
     LONG rdargs[LHX_NARGS];
     LONG ops;
     LONG rc;
     LONG with_paths;
     LONG i;
+    ULONG args_sz;
+
+    args = NULL;
+    rda = NULL;
+    rc = RETURN_FAIL;
+    args_sz = (ULONG)sizeof(struct LhxArgs);
 
     /* dos.library and utility.library before ReadArgs or any other API use. */
     if (!lhx_open_libs()) {
@@ -222,6 +231,14 @@ int main(int argc, char *argv[])
         return (int)rc;
     }
 
+    /* LhxArgs embeds ~1.3KB path/password buffers -- heap, not stack. */
+    args = (struct LhxArgs *)AllocMem(args_sz, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!args) {
+        lhx_print_error((STRPTR)"out of memory", 0);
+        lhx_set_rc(RETURN_FAIL);
+        return RETURN_FAIL;
+    }
+
     for (i = 0; i < LHX_NARGS; i++) {
         rdargs[i] = 0;
     }
@@ -236,71 +253,136 @@ int main(int argc, char *argv[])
         } else {
             lhx_print_usage();
         }
+        FreeMem(args, args_sz);
         lhx_set_rc(RETURN_FAIL);
         return RETURN_FAIL;
     }
 
-    lhx_args_from_rd(&args, rdargs);
+    lhx_args_from_rd(args, rdargs);
 
-    if (args.help) {
-        lhx_print_usage();
+    if (args->help) {
+        if (lhasa_print_cmd_help((STRPTR)"LhX")) {
+            lhx_set_rc(RETURN_OK);
+            FreeArgs(rda);
+            FreeMem(args, args_sz);
+            return RETURN_OK;
+        }
         FreeArgs(rda);
-        lhx_set_rc(RETURN_OK);
-        return RETURN_OK;
+        FreeMem(args, args_sz);
+        lhx_set_rc(RETURN_FAIL);
+        return RETURN_FAIL;
     }
 
-    if (!args.archive || !args.archive[0]) {
+    if (!args->archive || !args->archive[0]) {
         lhx_print_error((STRPTR)"ARCHIVE path required", 0);
-        lhx_print_usage();
+        Printf("LhX: type LhX HELP for documentation.\n", 0);
+        Flush(Output());
         FreeArgs(rda);
+        FreeMem(args, args_sz);
         lhx_set_rc(RETURN_FAIL);
         return RETURN_FAIL;
     }
 
-    ops = lhx_count_ops(&args);
+    ops = lhx_count_ops(args);
     if (ops != 1) {
         lhx_print_error((STRPTR)"specify exactly one operation", 0);
-        lhx_print_usage();
+        Printf("LhX: type LhX HELP for documentation.\n", 0);
+        Flush(Output());
         FreeArgs(rda);
+        FreeMem(args, args_sz);
         lhx_set_rc(RETURN_FAIL);
         return RETURN_FAIL;
     }
 
-    lhx_stabilize_args(&args);
+    lhx_stabilize_args(args);
     FreeArgs(rda);
     rda = NULL;
 
     LhBase = OpenLibrary((STRPTR)LH_NAME, (LONG)LH_MIN_VERSION);
     if (!LhBase) {
         lhx_print_error((STRPTR)"cannot open lh.library", 0);
+        FreeMem(args, args_sz);
         lhx_set_rc(RETURN_FAIL);
         return RETURN_FAIL;
     }
 
     rc = RETURN_OK;
     with_paths = 1;
-    if (args.nopaths) {
+    if (args->nopaths) {
         with_paths = 0;
     }
-    if (args.extractflat) {
+    if (args->extractflat) {
         with_paths = 0;
     }
     lhx_dbg_l((STRPTR)"with_paths", with_paths);
 
-    if (args.list) {
-        rc = lhx_cmd_list(&args);
-    } else if (args.extract || args.extractflat) {
-        rc = lhx_cmd_extract(&args, with_paths);
-    } else if (args.add) {
-        rc = lhx_cmd_add(&args);
-    } else if (args.test) {
-        rc = lhx_cmd_test(&args);
-    } else if (args.print) {
-        rc = lhx_cmd_print(&args);
+    /*
+     * ADD needs a concrete ARCHIVE.  LIST/EXTRACT/TEST may expand ARCHIVE
+     * as a filesystem wildcard and run once per match.  PRINT is single.
+     */
+    if (args->add) {
+        if (lhx_is_wild_pattern(args->archive)) {
+            lhx_print_error(
+                (STRPTR)"ADD requires a single ARCHIVE path (no wildcards)",
+                0);
+            rc = RETURN_FAIL;
+        } else {
+            rc = lhx_cmd_add(args);
+        }
+    } else if (args->list || args->extract || args->extractflat || args->test) {
+        if (lhx_is_wild_pattern(args->archive)) {
+            STRPTR arc_pats[2];
+            STRPTR *archives;
+            LONG xerr;
+            LONG onerc;
+            LONG ai;
+
+            arc_pats[0] = args->archive;
+            arc_pats[1] = NULL;
+            archives = lhx_expand_file_args(arc_pats, &xerr);
+            if (archives == NULL) {
+                rc = (xerr == ERROR_BREAK) ? RETURN_WARN : RETURN_FAIL;
+            } else {
+                rc = RETURN_OK;
+                for (ai = 0; archives[ai] != NULL; ai++) {
+                    if (lhx_check_break()) {
+                        Printf("LhX: *** Break\n", 0);
+                        Flush(Output());
+                        if (rc < RETURN_WARN) {
+                            rc = RETURN_WARN;
+                        }
+                        break;
+                    }
+                    Strncpy((STRPTR)args->archive_path, archives[ai],
+                        LHX_PATH_LEN);
+                    args->archive = (STRPTR)args->archive_path;
+                    onerc = RETURN_OK;
+                    if (args->list) {
+                        onerc = lhx_cmd_list(args);
+                    } else if (args->extract || args->extractflat) {
+                        onerc = lhx_cmd_extract(args, with_paths);
+                    } else if (args->test) {
+                        onerc = lhx_cmd_test(args);
+                    }
+                    if (onerc > rc) {
+                        rc = onerc;
+                    }
+                }
+            }
+        } else if (args->list) {
+            rc = lhx_cmd_list(args);
+        } else if (args->extract || args->extractflat) {
+            rc = lhx_cmd_extract(args, with_paths);
+        } else {
+            rc = lhx_cmd_test(args);
+        }
+    } else if (args->print) {
+        rc = lhx_cmd_print(args);
     }
 
     CloseLibrary(LhBase);
     LhBase = NULL;
+    FreeMem(args, args_sz);
     lhx_set_rc(rc);
     return (int)rc;
 }

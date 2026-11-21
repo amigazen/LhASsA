@@ -217,7 +217,7 @@ static int lha_apply_option_char(char c, int has_digit, int digit_val)
         g_opts.noop_no_progress = has_digit ? (digit_val != 0) : 1;
         break;
     case 'f':
-        g_opts.noop_ignore_filenotes = has_digit ? (digit_val != 0) : 1;
+        g_opts.ignore_filenotes = has_digit ? (digit_val != 0) : 1;
         break;
     case 'F':
         g_opts.noop_fast_progress = has_digit ? (digit_val != 0) : 1;
@@ -256,7 +256,7 @@ static int lha_apply_option_char(char c, int has_digit, int digit_val)
         g_opts.noop_filelist = has_digit ? (digit_val != 0) : 1;
         break;
     case 'I':
-        g_opts.noop_ignore_lhaopts = has_digit ? (digit_val != 0) : 1;
+        g_opts.ignore_lhaopts = has_digit ? (digit_val != 0) : 1;
         break;
     case 'g':
         g_opts.generic_format = has_digit ? (digit_val != 0) : 1;
@@ -282,7 +282,7 @@ static int lha_apply_option_char(char c, int has_digit, int digit_val)
         g_opts.ignore_paths = 0;
         break;
     case 'h':
-        g_opts.noop_no_homedirs = has_digit ? (digit_val != 0) : 1;
+        g_opts.no_homedirs = has_digit ? (digit_val != 0) : 1;
         break;
     case 'l':
         g_opts.noop_lower_names = has_digit ? (digit_val != 0) : 1;
@@ -297,10 +297,30 @@ static int lha_apply_option_char(char c, int has_digit, int digit_val)
         g_opts.noop_exclude = has_digit ? (digit_val != 0) : 1;
         break;
     case 'r':
-        g_opts.noop_recurse = has_digit ? (digit_val != 0) : 1;
+        g_opts.recurse = has_digit ? (digit_val != 0) : 1;
+        /* -r automatically enables path preservation; -x0 can still clear it. */
+        if (g_opts.recurse) {
+            g_opts.preserve_paths = 1;
+            g_opts.ignore_paths = 0;
+        }
         break;
     case 'R':
-        g_opts.noop_recurse_archives = has_digit ? (digit_val != 0) : 1;
+        g_opts.recurse_archives = has_digit ? (digit_val != 0) : 1;
+        break;
+    case 'e':
+        g_opts.empty_dirs = has_digit ? (digit_val != 0) : 1;
+        break;
+    case 'X':
+        g_opts.no_suffix = has_digit ? (digit_val != 0) : 1;
+        if (g_opts.no_suffix) {
+            g_opts.always_suffix = 0;
+        }
+        break;
+    case 'y':
+        g_opts.always_suffix = has_digit ? (digit_val != 0) : 1;
+        if (g_opts.always_suffix) {
+            g_opts.no_suffix = 0;
+        }
         break;
     case 's':
         g_opts.noop_add_no_arc = has_digit ? (digit_val != 0) : 1;
@@ -317,7 +337,6 @@ static int lha_apply_option_char(char c, int has_digit, int digit_val)
     case 'B':
     case 'c':
     case 'C':
-    case 'e':
     case 'E':
     case 'k':
     case 'K':
@@ -326,8 +345,6 @@ static int lha_apply_option_char(char c, int has_digit, int digit_val)
     case 'p':
     case 'P':
     case 'V':
-    case 'X':
-    case 'y':
     case 'Y':
     case 'Q':
         /* Accepted no-op for Amiga script compatibility. */
@@ -361,6 +378,22 @@ static int lha_apply_option_cluster(const char *opt)
     if (opt[0] == 'Q') {
         if (strcmp(opt, "Qd") == 0) {
             g_opts.noop_delete_autoshow = 1;
+            return 1;
+        }
+        if (strcmp(opt, "Qq") == 0 || strcmp(opt, "Qq1") == 0) {
+            g_opts.quick_add = 1;
+            return 1;
+        }
+        if (strcmp(opt, "Qq0") == 0) {
+            g_opts.quick_add = 0;
+            return 1;
+        }
+        if (strcmp(opt, "Qw") == 0 || strcmp(opt, "Qw1") == 0) {
+            g_opts.no_wildcards = 1;
+            return 1;
+        }
+        if (strcmp(opt, "Qw0") == 0) {
+            g_opts.no_wildcards = 0;
             return 1;
         }
         /* Other -Q* accepted as no-op for Amiga script compatibility. */
@@ -410,11 +443,85 @@ static int lha_looks_like_destdir(const char *path)
     return 0;
 }
 
+static int lha_apply_option_cluster(const char *opt);
+
+/*
+ * Classic LHAOPTS: options inserted as if typed after the program name.
+ */
+static void lha_apply_lhaopts_env(void)
+{
+    char buf[256];
+    char *p;
+    char *tok;
+
+    if (!lha_read_lhaopts(buf, sizeof(buf)) || buf[0] == '\0') {
+        return;
+    }
+    p = buf;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        tok = p;
+        while (*p && *p != ' ' && *p != '\t') {
+            p++;
+        }
+        if (*p) {
+            *p = '\0';
+            p++;
+        }
+        if (tok[0] == '-' && tok[1]) {
+            (void)lha_apply_option_cluster(tok + 1);
+        }
+    }
+}
+
+static int lha_argv_has_ignore_lhaopts(int argc, char **argv)
+{
+    int i;
+    const char *p;
+
+    for (i = 1; i < argc; i++) {
+        if (argv[i][0] != '-' || !argv[i][1]) {
+            continue;
+        }
+        if (strcmp(argv[i], "--") == 0) {
+            break;
+        }
+        p = argv[i] + 1;
+        while (*p) {
+            if (*p == 'I') {
+                p++;
+                if (*p >= '0' && *p <= '9') {
+                    if (*p != '0') {
+                        return 1;
+                    }
+                    while (*p >= '0' && *p <= '9') {
+                        p++;
+                    }
+                } else {
+                    return 1;
+                }
+            } else {
+                p++;
+                while (*p >= '0' && *p <= '9') {
+                    p++;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 int lha_parse_args(int argc, char **argv, lha_args *out, char **unknown_opt)
 {
     int i;
     int stop_opts;
     int cmd_idx;
+    char *resolved;
 
     if (unknown_opt) {
         *unknown_opt = NULL;
@@ -426,6 +533,10 @@ int lha_parse_args(int argc, char **argv, lha_args *out, char **unknown_opt)
     lha_opts_init(&g_opts);
     stop_opts = 0;
     cmd_idx = -1;
+
+    if (!lha_argv_has_ignore_lhaopts(argc, argv)) {
+        lha_apply_lhaopts_env();
+    }
 
     for (i = 1; i < argc; i++) {
         if (!stop_opts && argv[i][0] == '-' && argv[i][1]) {
@@ -477,6 +588,13 @@ int lha_parse_args(int argc, char **argv, lha_args *out, char **unknown_opt)
                 out->destdir = last;
                 out->file_count--;
             }
+        }
+    }
+    if (out->archive) {
+        resolved = lha_resolve_archive_name(out->archive);
+        if (resolved) {
+            free(out->archive);
+            out->archive = resolved;
         }
     }
     return 1;

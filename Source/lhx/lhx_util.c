@@ -141,9 +141,24 @@ void lhx_print_error(STRPTR msg, LONG code)
 
 void lhx_print_usage(void)
 {
-    Printf("LhX LIST|EXTRACT|EXTRACTFLAT|ADD|TEST|PRINT ARCHIVE [FILES...] [TO dir] [QUIET] [FORCE] [PASSWORD pass]\n", 0);
-    Printf("  FILES may use Amiga wildcards (#? *). Ctrl-C aborts between files.\n", 0);
+    /* Never dump a short synopsis; full text is LhX HELP (.help file). */
+    Printf("LhX: type LhX HELP for documentation.\n", 0);
     Flush(Output());
+}
+
+/*
+ * True when pattern contains AmigaDOS wildcards (ParsePatternNoCase > 0).
+ */
+int lhx_is_wild_pattern(STRPTR pattern)
+{
+    UBYTE parsed[LHX_PATTERN_BUF];
+    LONG wild;
+
+    if (!pattern || !pattern[0]) {
+        return 0;
+    }
+    wild = ParsePatternNoCase(pattern, parsed, (LONG)sizeof(parsed));
+    return (wild > 0) ? 1 : 0;
 }
 
 static void lhx_format_prot(LONG prot, char *out)
@@ -473,34 +488,264 @@ STRPTR *lhx_expand_file_args(STRPTR *patterns, LONG *err)
     return expand_ptrs;
 }
 
+/*
+ * Last path component of an Amiga or archive path.  Scans '/', '\\', and
+ * ':' itself -- FilePart() ignores '\\', so MS-DOS LHA names would keep
+ * their full path under NOPATHS/EXTRACTFLAT if we relied on it alone.
+ */
 int lhx_basename(STRPTR path, STRPTR out, LONG outlen)
 {
-    STRPTR fp;
+    STRPTR p;
+    STRPTR start;
+    STRPTR end;
+    LONG i;
+    LONG n;
 
     if (!path || !out || outlen <= 0) {
         return 0;
     }
-    fp = FilePart(path);
-    if (!fp) {
-        return 0;
+    end = path;
+    while (end[0] != '\0') {
+        end++;
     }
-    Strncpy(out, fp, outlen);
+    while (end > path && (end[-1] == '/' || end[-1] == '\\')) {
+        end--;
+    }
+    if (end == path) {
+        out[0] = '\0';
+        return 1;
+    }
+    start = path;
+    for (p = path; p < end; p++) {
+        if (*p == '/' || *p == '\\' || *p == ':') {
+            start = p + 1;
+        }
+    }
+    n = (LONG)(end - start);
+    if (n >= outlen) {
+        n = outlen - 1;
+    }
+    for (i = 0; i < n; i++) {
+        out[i] = start[i];
+    }
+    out[n] = '\0';
     return 1;
 }
 
+/*
+ * Count Amiga path components (split on '/' and ':').
+ */
+static LONG lhx_component_count(STRPTR path)
+{
+    LONG n;
+    LONG in_comp;
+    STRPTR p;
+
+    n = 0;
+    in_comp = 0;
+    if (!path) {
+        return 0;
+    }
+    for (p = path; *p != '\0'; p++) {
+        if (*p == '/' || *p == ':') {
+            if (in_comp) {
+                n++;
+                in_comp = 0;
+            }
+        } else {
+            in_comp = 1;
+        }
+    }
+    if (in_comp) {
+        n++;
+    }
+    return n;
+}
+
+/*
+ * True if path names a volume (contains ':').
+ */
+static int lhx_path_has_volume(STRPTR path)
+{
+    STRPTR p;
+
+    if (!path) {
+        return 0;
+    }
+    for (p = path; *p != '\0'; p++) {
+        if (*p == ':') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Replace the first ':' with '/' (archive member names cannot use ':').
+ */
+static void lhx_colon_to_slash(STRPTR s)
+{
+    LONG i;
+
+    if (!s) {
+        return;
+    }
+    for (i = 0; s[i] != '\0'; i++) {
+        if (s[i] == ':') {
+            s[i] = '/';
+            return;
+        }
+    }
+}
+
+/*
+ * Pointer to the start of the last n '/' -separated components, or path
+ * if there are fewer than n-1 separators.
+ */
+static STRPTR lhx_tail_components(STRPTR path, LONG n)
+{
+    LONG count;
+    STRPTR p;
+    LONG len;
+
+    if (!path || n <= 0) {
+        return path;
+    }
+    len = 0;
+    while (path[len] != '\0') {
+        len++;
+    }
+    count = 0;
+    p = path + len;
+    while (p > path) {
+        p--;
+        if (*p == '/') {
+            count++;
+            if (count == n) {
+                return p + 1;
+            }
+        }
+    }
+    return path;
+}
+
+/*
+ * Fallback when Lock/NameFromLock fails: keep typed spelling, only
+ * normalise volume ':' to '/'.
+ */
+static int lhx_arcname_fallback(STRPTR path, STRPTR out, LONG outlen,
+    LONG nopaths)
+{
+    if (nopaths) {
+        return lhx_basename(path, out, outlen);
+    }
+    Strncpy(out, path, outlen);
+    out[outlen - 1] = '\0';
+    lhx_colon_to_slash(out);
+    return 1;
+}
+
+/*
+ * Build the archive member name for ADD.
+ * Default: path as given (volume ':' -> '/'), with each component's
+ * capitalisation taken from the filesystem via NameFromLock.
+ * Relative paths keep a relative shape (volume prefix from NameFromLock
+ * is stripped to match the component count of the input).
+ * NOPATHS: on-disk basename only.
+ */
+int lhx_make_arcname(STRPTR path, STRPTR out, LONG outlen, LONG nopaths)
+{
+    BPTR lock;
+    char full[LHX_PATH_LEN];
+    STRPTR use;
+    LONG ncomp;
+
+    if (!path || !out || outlen <= 0) {
+        return 0;
+    }
+
+    lock = Lock(path, ACCESS_READ);
+    if (lock == (BPTR)NULL) {
+        return lhx_arcname_fallback(path, out, outlen, nopaths);
+    }
+    if (!NameFromLock(lock, (STRPTR)full, (LONG)sizeof(full))) {
+        UnLock(lock);
+        return lhx_arcname_fallback(path, out, outlen, nopaths);
+    }
+    UnLock(lock);
+
+    lhx_colon_to_slash(full);
+
+    if (lhx_path_has_volume(path)) {
+        use = (STRPTR)full;
+    } else {
+        /* Relative input: keep the same number of trailing components. */
+        ncomp = lhx_component_count(path);
+        use = lhx_tail_components((STRPTR)full, ncomp);
+    }
+
+    if (nopaths) {
+        return lhx_basename(use, out, outlen);
+    }
+    Strncpy(out, use, outlen);
+    out[outlen - 1] = '\0';
+    return 1;
+}
+
+/*
+ * Join dest dir + relative member name.  Unlike AddPart(), accepts a
+ * multi-component relative name (dir/file) so EXTRACT can recreate
+ * stored paths under TO=; NOPATHS callers pass a basename only.
+ */
 int lhx_path_join(STRPTR out, LONG outlen, STRPTR dir, STRPTR name)
 {
+    LONG dlen;
+    LONG nlen;
+    LONG i;
+    LONG need_slash;
+
     if (!out || outlen <= 0 || !name) {
         return 0;
     }
     if (!dir || !dir[0]) {
         Strncpy(out, name, outlen);
+        out[outlen - 1] = '\0';
         return 1;
     }
-    Strncpy(out, dir, outlen);
-    if (!AddPart(out, name, (ULONG)outlen)) {
+    /* Absolute name (vol:...) replaces the directory. */
+    for (i = 0; name[i] != '\0'; i++) {
+        if (name[i] == ':' && i > 0) {
+            Strncpy(out, name, outlen);
+            out[outlen - 1] = '\0';
+            return 1;
+        }
+    }
+    dlen = 0;
+    while (dir[dlen] != '\0') {
+        dlen++;
+    }
+    nlen = 0;
+    while (name[nlen] != '\0') {
+        nlen++;
+    }
+    need_slash = 0;
+    if (dlen > 0 && dir[dlen - 1] != ':' && dir[dlen - 1] != '/') {
+        need_slash = 1;
+    }
+    if (dlen + need_slash + nlen + 1 > outlen) {
         return 0;
     }
+    for (i = 0; i < dlen; i++) {
+        out[i] = dir[i];
+    }
+    if (need_slash) {
+        out[dlen] = '/';
+        dlen++;
+    }
+    for (i = 0; i < nlen; i++) {
+        out[dlen + i] = name[i];
+    }
+    out[dlen + nlen] = '\0';
     return 1;
 }
 

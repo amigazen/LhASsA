@@ -15,9 +15,11 @@
 #include <exec/memory.h>
 #include <dos/dos.h>
 #include <utility/tagitem.h>
+#include <workbench/workbench.h>
 #include <proto/exec.h>
 #include <proto/dos.h>
 #include <proto/utility.h>
+#include <proto/icon.h>
 #include <libraries/lh.h>
 #include <proto/lh.h>
 
@@ -28,26 +30,12 @@ extern struct DosLibrary *DOSBase;
 extern struct Library *UtilityBase;
 extern struct Library *LhBase;
 
-/*
- * Shown when users extract a Bin with LhA (Load.displayme autoshow member).
- * Load installs via Manifest only and never extracts this file.
- */
-static const char handle_bin_autoshow_text[] =
-    "LhASsA Bin package\n"
-    "==================\n"
-    "\n"
-    "This archive is meant to be installed with Load, not unpacked with\n"
-    "plain LhA extract.\n"
-    "\n"
-    "  Load BIN=<this archive>\n"
-    "\n"
-    "Load reads the Manifest, checks dependencies, picks CPU/FPU/MMU\n"
-    "variants for your machine, and installs files to the correct places\n"
-    "(LIBS:, Devs:, or your application directory).\n"
-    "\n"
-    "Extracting here only drops raw archive members on disk and will not\n"
-    "install the package correctly.\n"
-    "\n";
+/* proto/icon.h stubs use this global. */
+struct Library *IconBase = NULL;
+
+/* Classic Parts Project icon (planar); see make_parts_icon.py / Parts.info. */
+extern const unsigned char handle_parts_info[];
+extern const unsigned long handle_parts_info_len;
 
 void handle_print_error(STRPTR msg, LONG code)
 {
@@ -64,14 +52,166 @@ void handle_print_error(STRPTR msg, LONG code)
 
 void handle_print_usage(void)
 {
-    Printf("Handle FROM=dir NAME=pkg PRIMARY=file [VERSION=ver] [OUT=dir]\n", 0);
-    Printf("       [FORCE] [QUIET]\n", 0);
-    Printf("  FROM named SYS => system package (Libs/, Devs/, ...).\n", 0);
-    Printf("  Otherwise => application package (tree as-is).\n", 0);
-    Printf("  Writes NAME.lha; embeds $VER in -package.ver (LH0 metadata).\n", 0);
-    Printf("  Tags: .020 .030 .040 .060 .881 .882 .mmu .wos .pup\n", 0);
-    Printf("  Skips dot-prefixed names (.git, .svn, ...).\n", 0);
+    /* Never dump a short synopsis; full text is Handle HELP (.help file). */
+    Printf("Handle: type Handle HELP for documentation.\n", 0);
     Flush(Output());
+}
+
+/*
+ * Stage the embedded Parts.info under T: so GetDiskObject() can parse it.
+ * Returns 1 if T:LhPartsIcon.info was written.
+ */
+static LONG handle_stage_parts_template(void)
+{
+    BPTR fh;
+    LONG wrote;
+
+    if (handle_parts_info_len == 0) {
+        return 0;
+    }
+    DeleteFile((STRPTR)"T:LhPartsIcon.info");
+    fh = Open((STRPTR)"T:LhPartsIcon.info", MODE_NEWFILE);
+    if (fh == (BPTR)NULL) {
+        return 0;
+    }
+    wrote = Write(fh, (APTR)handle_parts_info, (LONG)handle_parts_info_len);
+    Close(fh);
+    if (wrote != (LONG)handle_parts_info_len) {
+        DeleteFile((STRPTR)"T:LhPartsIcon.info");
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * Companion Workbench icon for the Bin: Parts Project art, DefaultTool Load.
+ *
+ * icon.library contract (see autodocs / RKM):
+ *   GetDiskObject / GetDefDiskObject -> PutDiskObject -> FreeDiskObject
+ * If you temporarily replace do_DefaultTool, restore the original pointer
+ * before FreeDiskObject so its free list stays consistent.
+ */
+static LONG handle_write_bin_icon(STRPTR bin_path, ULONG quiet)
+{
+    struct DiskObject *dobj;
+    STRPTR old_tool;
+    LONG ok;
+    LONG opened_icon;
+
+    if (!bin_path || !bin_path[0]) {
+        return 0;
+    }
+
+    opened_icon = 0;
+    if (!IconBase) {
+        IconBase = OpenLibrary((STRPTR)"icon.library", 37L);
+        if (!IconBase) {
+            if (!quiet) {
+                handle_print_error((STRPTR)"cannot open icon.library", 0);
+            }
+            return 0;
+        }
+        opened_icon = 1;
+    }
+
+    dobj = NULL;
+    if (handle_stage_parts_template()) {
+        dobj = GetDiskObject((STRPTR)"T:LhPartsIcon");
+        /* Drop the staging file; DiskObject is fully in memory. */
+        if (IconBase->lib_Version >= 37) {
+            DeleteDiskObject((STRPTR)"T:LhPartsIcon");
+        } else {
+            DeleteFile((STRPTR)"T:LhPartsIcon.info");
+        }
+    }
+    if (!dobj) {
+        dobj = GetDefDiskObject(WBPROJECT);
+    }
+    if (!dobj) {
+        if (!quiet) {
+            handle_print_error((STRPTR)"cannot get Project icon", IoErr());
+        }
+        if (opened_icon) {
+            CloseLibrary(IconBase);
+            IconBase = NULL;
+        }
+        return 0;
+    }
+
+    /*
+     * PutDiskObject writes name.info.  Swap DefaultTool only for the
+     * write, then put the original pointer back before FreeDiskObject.
+     */
+    old_tool = dobj->do_DefaultTool;
+    dobj->do_DefaultTool = (STRPTR)"Load";
+    dobj->do_Type = WBPROJECT;
+
+    ok = PutDiskObject(bin_path, dobj);
+
+    dobj->do_DefaultTool = old_tool;
+    FreeDiskObject(dobj);
+
+    if (opened_icon) {
+        CloseLibrary(IconBase);
+        IconBase = NULL;
+    }
+
+    if (!ok) {
+        if (!quiet) {
+            handle_print_error((STRPTR)"cannot write Project icon", IoErr());
+            Printf("Handle:   %s.info\n", (LONG)bin_path);
+            Flush(Output());
+        }
+        return 0;
+    }
+    if (!quiet) {
+        Printf("Handle: wrote %s.info\n", (LONG)bin_path);
+        Flush(Output());
+    }
+    return 1;
+}
+
+/* Delete path.info beside an existing Bin (FORCE overwrite). */
+static void handle_delete_bin_info(STRPTR bin_path)
+{
+    LONG opened_icon;
+
+    if (!bin_path || !bin_path[0]) {
+        return;
+    }
+
+    opened_icon = 0;
+    if (!IconBase) {
+        IconBase = OpenLibrary((STRPTR)"icon.library", 37L);
+        if (IconBase) {
+            opened_icon = 1;
+        }
+    }
+    if (IconBase && IconBase->lib_Version >= 37) {
+        DeleteDiskObject(bin_path);
+    } else {
+        char info_path[HANDLE_PATH_LEN];
+        LONG L;
+
+        Strncpy((STRPTR)info_path, bin_path, HANDLE_PATH_LEN);
+        L = 0;
+        while (info_path[L] != '\0' && L < HANDLE_PATH_LEN - 1) {
+            L++;
+        }
+        if (L + 5 < HANDLE_PATH_LEN) {
+            info_path[L++] = '.';
+            info_path[L++] = 'i';
+            info_path[L++] = 'n';
+            info_path[L++] = 'f';
+            info_path[L++] = 'o';
+            info_path[L] = '\0';
+            DeleteFile((STRPTR)info_path);
+        }
+    }
+    if (opened_icon) {
+        CloseLibrary(IconBase);
+        IconBase = NULL;
+    }
 }
 
 /*
@@ -145,7 +285,7 @@ LONG handle_build_out_path(struct HandleArgs *args, STRPTR out, LONG outlen)
         return 0;
     }
     Strncpy((STRPTR)leaf, args->name, HANDLE_VAL_LEN);
-    handle_str_cat((STRPTR)leaf, HANDLE_VAL_LEN, (STRPTR)".lha");
+    handle_str_cat((STRPTR)leaf, HANDLE_VAL_LEN, (STRPTR)".bin");
 
     if (args->out && args->out[0]) {
         Strncpy(out, args->out, outlen);
@@ -338,13 +478,25 @@ static LONG handle_walk_dir(
 {
     struct FileInfoBlock *fib;
     LONG ok;
-    char child_disk[HANDLE_PATH_LEN];
-    char child_arc[HANDLE_PATH_LEN];
+    STRPTR child_disk;
+    STRPTR child_arc;
     BPTR child_lock;
 
+    /* Recursive -- heap path buffers so deep trees fit in a 4K stack. */
+    child_disk = (STRPTR)AllocMem(HANDLE_PATH_LEN, MEMF_PUBLIC | MEMF_CLEAR);
+    child_arc = (STRPTR)AllocMem(HANDLE_PATH_LEN, MEMF_PUBLIC | MEMF_CLEAR);
     fib = (struct FileInfoBlock *)AllocMem(
         (ULONG)sizeof(struct FileInfoBlock), MEMF_PUBLIC | MEMF_CLEAR);
-    if (!fib) {
+    if (!child_disk || !child_arc || !fib) {
+        if (child_disk) {
+            FreeMem(child_disk, HANDLE_PATH_LEN);
+        }
+        if (child_arc) {
+            FreeMem(child_arc, HANDLE_PATH_LEN);
+        }
+        if (fib) {
+            FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+        }
         handle_print_error((STRPTR)"out of memory", 0);
         return 0;
     }
@@ -352,6 +504,8 @@ static LONG handle_walk_dir(
     ok = Examine(dir_lock, fib);
     if (!ok || fib->fib_DirEntryType <= 0) {
         FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+        FreeMem(child_arc, HANDLE_PATH_LEN);
+        FreeMem(child_disk, HANDLE_PATH_LEN);
         handle_print_error((STRPTR)"not a directory", IoErr());
         return 0;
     }
@@ -364,16 +518,20 @@ static LONG handle_walk_dir(
             continue;
         }
 
-        if (!handle_path_join((STRPTR)child_disk, HANDLE_PATH_LEN, disk_dir,
+        if (!handle_path_join(child_disk, HANDLE_PATH_LEN, disk_dir,
                 fib->fib_FileName)) {
             handle_print_error((STRPTR)"path too long", 0);
             FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+            FreeMem(child_arc, HANDLE_PATH_LEN);
+            FreeMem(child_disk, HANDLE_PATH_LEN);
             return 0;
         }
-        if (!handle_arc_join((STRPTR)child_arc, HANDLE_PATH_LEN, arc_rel,
+        if (!handle_arc_join(child_arc, HANDLE_PATH_LEN, arc_rel,
                 fib->fib_FileName)) {
             handle_print_error((STRPTR)"archive path too long", 0);
             FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+            FreeMem(child_arc, HANDLE_PATH_LEN);
+            FreeMem(child_disk, HANDLE_PATH_LEN);
             return 0;
         }
 
@@ -385,25 +543,30 @@ static LONG handle_walk_dir(
         }
 
         if (fib->fib_DirEntryType > 0) {
-            child_lock = Lock((STRPTR)child_disk, ACCESS_READ);
+            child_lock = Lock(child_disk, ACCESS_READ);
             if (child_lock == (BPTR)NULL) {
                 handle_print_error((STRPTR)"cannot lock subdirectory", IoErr());
                 Printf("  %s\n", (LONG)child_disk);
                 Flush(Output());
                 FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+                FreeMem(child_arc, HANDLE_PATH_LEN);
+                FreeMem(child_disk, HANDLE_PATH_LEN);
                 return 0;
             }
-            if (!handle_walk_dir(args, arc, child_lock, (STRPTR)child_disk,
-                    (STRPTR)child_arc)) {
+            if (!handle_walk_dir(args, arc, child_lock, child_disk,
+                    child_arc)) {
                 UnLock(child_lock);
                 FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+                FreeMem(child_arc, HANDLE_PATH_LEN);
+                FreeMem(child_disk, HANDLE_PATH_LEN);
                 return 0;
             }
             UnLock(child_lock);
         } else {
-            if (!handle_add_one(args, arc, (STRPTR)child_disk,
-                    (STRPTR)child_arc, fib)) {
+            if (!handle_add_one(args, arc, child_disk, child_arc, fib)) {
                 FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+                FreeMem(child_arc, HANDLE_PATH_LEN);
+                FreeMem(child_disk, HANDLE_PATH_LEN);
                 return 0;
             }
         }
@@ -413,10 +576,14 @@ static LONG handle_walk_dir(
     if (IoErr() != ERROR_NO_MORE_ENTRIES) {
         handle_print_error((STRPTR)"directory scan failed", IoErr());
         FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+        FreeMem(child_arc, HANDLE_PATH_LEN);
+        FreeMem(child_disk, HANDLE_PATH_LEN);
         return 0;
     }
 
     FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+    FreeMem(child_arc, HANDLE_PATH_LEN);
+    FreeMem(child_disk, HANDLE_PATH_LEN);
     return 1;
 }
 
@@ -532,6 +699,8 @@ LONG handle_run(struct HandleArgs *args)
             handle_print_error((STRPTR)"cannot delete existing output", IoErr());
             goto out_free;
         }
+        /* Drop stale companion icon before rewriting the Bin. */
+        handle_delete_bin_info(args->out_path);
     }
 
     {
@@ -581,14 +750,40 @@ LONG handle_run(struct HandleArgs *args)
         Flush(Output());
     }
 
-    if (!LhAddEntryA(arc, (STRPTR)HANDLE_BIN_AUTOSHOW,
-            (APTR)handle_bin_autoshow_text,
-            (LONG)(sizeof(handle_bin_autoshow_text) - 1), store_tags)) {
-        LhCloseArchive(arc);
-        UnLock(from_lock);
-        DeleteFile(args->out_path);
-        handle_print_error((STRPTR)"cannot add Load.displayme", LhErr());
-        goto out_free;
+    {
+        STRPTR dmbuf;
+        LONG dmlen;
+
+        dmbuf = (STRPTR)AllocMem(HANDLE_MANIFEST_MAX, MEMF_PUBLIC | MEMF_CLEAR);
+        if (!dmbuf) {
+            LhCloseArchive(arc);
+            UnLock(from_lock);
+            DeleteFile(args->out_path);
+            handle_print_error((STRPTR)"out of memory (displayme)", 0);
+            goto out_free;
+        }
+        if (!handle_build_displayme(scan, dmbuf, HANDLE_MANIFEST_MAX)) {
+            FreeMem(dmbuf, HANDLE_MANIFEST_MAX);
+            LhCloseArchive(arc);
+            UnLock(from_lock);
+            DeleteFile(args->out_path);
+            handle_print_error((STRPTR)"cannot build Load.displayme", 0);
+            goto out_free;
+        }
+        dmlen = 0;
+        while (dmbuf[dmlen] != '\0') {
+            dmlen++;
+        }
+        if (!LhAddEntryA(arc, (STRPTR)HANDLE_BIN_AUTOSHOW, dmbuf, dmlen,
+                store_tags)) {
+            FreeMem(dmbuf, HANDLE_MANIFEST_MAX);
+            LhCloseArchive(arc);
+            UnLock(from_lock);
+            DeleteFile(args->out_path);
+            handle_print_error((STRPTR)"cannot add Load.displayme", LhErr());
+            goto out_free;
+        }
+        FreeMem(dmbuf, HANDLE_MANIFEST_MAX);
     }
     if (!args->quiet) {
         Printf("ADD %s\n", (LONG)HANDLE_BIN_AUTOSHOW);
@@ -640,6 +835,18 @@ LONG handle_run(struct HandleArgs *args)
         Printf("Handle: wrote %s\n", (LONG)args->out_path);
         Flush(Output());
     }
+
+    /*
+     * Companion Project icon (DefaultTool Load).  Bin is already good if
+     * this fails; warn but still return OK.
+     */
+    if (!handle_write_bin_icon(args->out_path, args->quiet)) {
+        if (!args->quiet) {
+            handle_print_error(
+                (STRPTR)"Bin written; Project icon was not created", 0);
+        }
+    }
+
     rc = RETURN_OK;
 
 out_free:

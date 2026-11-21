@@ -1,0 +1,160 @@
+   NAME
+	LhX - Lean AmigaDOS LHA archiver (lh.library client).
+
+   FORMAT
+	LhX LIST|EXTRACT|EXTRACTFLAT|ADD|TEST|PRINT ARCHIVE
+	     [{<file|pattern>}] [TO <dir>] [QUIET] [FORCE] [NOPATHS]
+	     [PASSWORD <pass>] [HELP]
+
+   TEMPLATE
+	L=LIST/S,X=EXTRACT/S,EXTRACTFLAT/S,A=ADD/S,T=TEST/S,PRINT/S,
+	HELP/S,ARCHIVE,FILES/M,TO/K,QUIET/S,FORCE/S,NP=NOPATH=NOPATHS/S,
+	PASSWORD/K
+
+   PATH
+	C:LhX
+
+   FUNCTION
+	LhX is the LhASsA native AmigaDOS front end for archives. It
+	uses ReadArgs, AmigaDOS wildcards, and lh.library rather than
+	the classic LhA letter-option syntax. Exactly one operation
+	switch must be given together with ARCHIVE.
+
+	LIST prints archive members in a LIST-like layout (name, size,
+	protection, date, time, and filenote when present). EXTRACT
+	restores files with stored paths; EXTRACTFLAT (or EXTRACT with
+	NOPATHS) restores base names only. ADD creates or updates an
+	archive from FILES patterns, storing each file under the path
+	given on the command line (on-disk capitalisation; volume ':'
+	becomes '/') unless NOPATHS is set. Same-named members are
+	replaced. TEST checks member CRC integrity. PRINT writes
+	selected member data to the current output.
+
+	FILES arguments may use AmigaDOS wildcards such as #? and *.
+	For LIST, EXTRACT, and TEST, ARCHIVE may also be a filesystem
+	wildcard; each matching archive is processed in turn. ADD and
+	PRINT require a single concrete ARCHIVE path. Ctrl-C aborts
+	cleanly between files. When launched from Workbench as a
+	project default tool for a .lha file, LhX remaps the archive
+	onto the LHA: volume (Lh-handler) and opens it as a drawer when
+	the handler is mounted; otherwise it extracts to T:LhX/ with a
+	progress requester.
+
+	Unlike classic LhA a, LhX ADD keeps full paths by default and
+	replaces duplicates. Use LhA when you need 2.15 letter options,
+	home directories, or -r recursion.
+
+   OPTIONS
+	LIST (L)
+	    List the contents of ARCHIVE. With QUIET, only names are
+	    printed. ARCHIVE may be a wildcard matching several
+	    archives.
+
+	EXTRACT (X)
+	    Extract members. Paths from the archive are recreated unless
+	    NOPATHS or EXTRACTFLAT is used. TO sets the destination
+	    directory. ARCHIVE may be a wildcard matching several
+	    archives.
+
+	EXTRACTFLAT
+	    Extract members using base names only (no directory path).
+
+	ADD (A)
+	    Add FILES from the filesystem into ARCHIVE. Each member is
+	    stored with the full path as given (volume ':' becomes '/'),
+	    using on-disk capitalisation for each component, unless
+	    NOPATHS is set. A member that already exists under the same
+	    name (case-insensitive) is replaced. ARCHIVE must be a
+	    single path (no wildcards).
+
+	TEST (T)
+	    Test CRC integrity of members in ARCHIVE. ARCHIVE may be a
+	    wildcard matching several archives.
+
+	PRINT
+	    Print selected member contents to the current output.
+	    ARCHIVE must be a single path.
+
+	ARCHIVE
+	    Path of the .lha / .lzh archive (required). For LIST,
+	    EXTRACT, and TEST this may be an AmigaDOS pattern that
+	    expands to one or more archive files. For ADD and PRINT it
+	    must name a single archive.
+
+	FILES
+	    Zero or more file names or patterns. For LIST, EXTRACT,
+	    TEST, and PRINT these select archive members. For ADD they
+	    are filesystem paths/patterns to store. If omitted, all
+	    members are selected for list/extract/test/print. ADD with
+	    no FILES is an error (unlike classic LhA a, which means
+	    "all files in the current directory").
+
+	TO <dir>
+	    Destination directory for EXTRACT / EXTRACTFLAT.
+
+	QUIET
+	    Reduce console chatter (list shows names only).
+
+	FORCE
+	    Overwrite existing files on extract when allowed by
+	    protection bits.
+
+	NOPATHS (NOPATH, NP)
+	    On extract: ignore stored paths (same effect as EXTRACTFLAT
+	    for path handling). On ADD: store basename only instead of
+	    the full command-line path, and replace any existing member
+	    with that same basename (including older path-form names).
+
+	PASSWORD <pass>
+	    Password for protected archives (passed to lh.library;
+	    support is limited).
+
+	HELP
+	    Print this help text from HELP:<locale>/LhASsA/LhX.help
+	    (falls back to HELP:english/LhASsA/LhX.help), otherwise the
+	    short usage line, then exit successfully.
+
+	You must specify exactly one of LIST, EXTRACT, EXTRACTFLAT,
+	ADD, TEST, or PRINT.
+
+   EXAMPLES
+	    1> LhX LIST Archive.lha
+
+	Lists every member of Archive.lha.
+
+	    1> LhX LIST RAM:#?.lha
+
+	Lists every archive in RAM: whose name matches #?.lha.
+
+	    1> LhX EXTRACT Archive.lha TO=RAM:Out/
+
+	Extracts all members into RAM:Out/, recreating paths.
+
+	    1> LhX EXTRACTFLAT Archive.lha #?.doc TO=RAM:
+
+	Extracts only .doc members, flattened into RAM:.
+
+	    1> LhX ADD Backup.lha SYS/C/LhX
+
+	Adds SYS/C/LhX into Backup.lha as member SYS/C/LhX (replacing
+	any existing member of that name).
+
+	    1> LhX ADD Backup.lha Work:Sources/#? QUIET
+
+	Adds matching source files into Backup.lha, keeping each
+	matched path (with ':' normalised to '/').
+
+	    1> LhX ADD Backup.lha SYS/C/LhX NOPATHS
+
+	Adds the same file as member LhX (basename only).
+
+	    1> LhX TEST Archive.lha
+
+	Verifies CRC of every member.
+
+	    1> LhX PRINT Archive.lha ReadMe
+
+	Writes the ReadMe member to the current output.
+
+   SEE ALSO
+	LhA, Load, Handle

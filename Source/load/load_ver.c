@@ -5,14 +5,17 @@
  *
  * load_ver.c - Scan and compare Amiga $VER: tags.
  *
- * Canonical form (see ../../../../version.txt � AmigaMail 2.0):
+ * Canonical form (see ////version.txt � AmigaMail 2.0):
  *   $VER: name major.minor (dd.mm.yy)
  * Date separators may be '.' or '/' (e.g. (20.3.91) or (20/3/91)).
  *
  * Return from load_ver_scan_file:
  *   1  = parsed $VER: successfully
- *   0  = I/O error, or $VER: present but unparseable (hard failure)
- *  -1  = file OK but no $VER: tag (caller decides)
+ *   0  = I/O error
+ *  -1  = file OK but no usable $VER: (missing, or only prose hits)
+ *
+ * Scan is capped -- real Amiga $VER: lives near the start of a binary.
+ * Reading whole libraries for a tag freezes the machine.
  */
 
 #include <exec/types.h>
@@ -29,6 +32,8 @@ extern struct DosLibrary *DOSBase;
 extern struct Library *UtilityBase;
 
 #define LOAD_VER_BUF 4096
+/* Enough for hunk header + $VER; never walk multi-megabyte files. */
+#define LOAD_VER_SCAN_MAX 32768L
 
 void load_ver_clear(struct LoadVerInfo *vi)
 {
@@ -207,17 +212,92 @@ LONG load_ver_parse_dotted(STRPTR s, ULONG *major, ULONG *minor)
     return load_ver_parse_token(s, major, minor);
 }
 
-LONG load_ver_scan_file(STRPTR path, struct LoadVerInfo *vi)
+/*
+ * Parse Manifest Ver= value: major.minor or major.minor(dd.mm.yy).
+ * Used by Load for File: lines written by Handle (no $VER: extract needed).
+ */
+LONG load_ver_parse_short(STRPTR s, struct LoadVerInfo *vi)
 {
-    BPTR fh;
+    char num[32];
+    LONG i;
+    STRPTR p;
+
+    load_ver_clear(vi);
+    if (!s || !vi || !s[0]) {
+        return 0;
+    }
+    i = 0;
+    p = s;
+    while (*p != '\0' && *p != '(' && i < (LONG)sizeof(num) - 1) {
+        num[i++] = *p++;
+    }
+    num[i] = '\0';
+    while (i > 0 && (num[i - 1] == ' ' || num[i - 1] == '\t')) {
+        i--;
+        num[i] = '\0';
+    }
+    if (!load_ver_parse_token((STRPTR)num, &vi->major, &vi->minor)) {
+        load_ver_clear(vi);
+        return 0;
+    }
+    vi->have_ver = 1;
+    if (*p == '(') {
+        if (!load_ver_parse_date(p, &vi->ymd)) {
+            /* Version alone is still usable; drop a bad date. */
+            vi->have_date = 0;
+            vi->ymd = 0;
+        } else {
+            vi->have_date = 1;
+        }
+    }
+    return 1;
+}
+
+LONG load_ver_scan_mem(APTR data, LONG len, struct LoadVerInfo *vi)
+{
     UBYTE *buf;
-    LONG r;
-    LONG keep;
     LONG i;
     LONG start;
     char verline[LOAD_VER_LINE_MAX];
     LONG vlen;
+
+    load_ver_clear(vi);
+    if (!data || len <= 0 || !vi) {
+        return -1;
+    }
+    buf = (UBYTE *)data;
+    for (i = 0; i + 5 <= len; i++) {
+        if (buf[i] == '$' && buf[i + 1] == 'V' && buf[i + 2] == 'E'
+            && buf[i + 3] == 'R' && buf[i + 4] == ':') {
+            vlen = 0;
+            start = i;
+            while (start < len && vlen < LOAD_VER_LINE_MAX - 1) {
+                if (buf[start] == '\0' || buf[start] == '\n'
+                    || buf[start] == '\r') {
+                    break;
+                }
+                verline[vlen++] = (char)buf[start++];
+            }
+            verline[vlen] = '\0';
+            return load_ver_parse_line((STRPTR)verline, vi) ? 1 : 0;
+        }
+    }
+    return -1;
+}
+
+LONG load_ver_scan_file(STRPTR path, struct LoadVerInfo *vi)
+{
+    BPTR fh;
+    UBYTE *buf;
+    char verline[LOAD_VER_LINE_MAX];
+    LONG r;
+    LONG keep;
+    LONG i;
+    LONG start;
+    LONG vlen;
     LONG found;
+    LONG total;
+    LONG want;
 
     load_ver_clear(vi);
     if (!path || !vi) {
@@ -234,17 +314,30 @@ LONG load_ver_scan_file(STRPTR path, struct LoadVerInfo *vi)
     }
     keep = 0;
     found = 0;
+    total = 0;
     for (;;) {
-        r = Read(fh, buf + keep, LOAD_VER_BUF);
+        if (total >= LOAD_VER_SCAN_MAX) {
+            break;
+        }
+        want = LOAD_VER_BUF;
+        if (total + want > LOAD_VER_SCAN_MAX) {
+            want = LOAD_VER_SCAN_MAX - total;
+        }
+        r = Read(fh, buf + keep, want);
         if (r < 0) {
             FreeMem(buf, LOAD_VER_BUF + 8);
             Close(fh);
             return 0;
         }
+        /*
+         * EOF with nothing left to scan.  IMPORTANT: do not loop forever
+         * when keep>0 at EOF (old code did r+=keep then never saw r==0).
+         */
         if (r == 0 && keep == 0) {
             break;
         }
-        r += keep;
+        total += r;
+        r = r + keep;
         for (i = 0; i + 5 <= r; i++) {
             if (buf[i] == '$' && buf[i + 1] == 'V' && buf[i + 2] == 'E'
                 && buf[i + 3] == 'R' && buf[i + 4] == ':') {
@@ -258,27 +351,30 @@ LONG load_ver_scan_file(STRPTR path, struct LoadVerInfo *vi)
                     verline[vlen++] = (char)buf[start++];
                 }
                 verline[vlen] = '\0';
-                if (!load_ver_parse_line((STRPTR)verline, vi)) {
-                    FreeMem(buf, LOAD_VER_BUF + 8);
-                    Close(fh);
-                    /* $VER: present but unparseable. */
-                    return 0;
+                /*
+                 * Prose can mention "$VER:" (.help files).  Skip bad hits
+                 * and keep looking -- do not abort the whole scan.
+                 */
+                if (load_ver_parse_line((STRPTR)verline, vi)) {
+                    found = 1;
+                    break;
                 }
-                found = 1;
-                break;
+                load_ver_clear(vi);
             }
         }
         if (found) {
             break;
         }
-        if (r == 0) {
+        if (r == keep) {
             break;
         }
         keep = 4;
         if (keep > r) {
             keep = r;
         }
-        CopyMem(buf + r - keep, buf, (ULONG)keep);
+        if (keep > 0) {
+            CopyMem(buf + r - keep, buf, (ULONG)keep);
+        }
     }
     FreeMem(buf, LOAD_VER_BUF + 8);
     Close(fh);

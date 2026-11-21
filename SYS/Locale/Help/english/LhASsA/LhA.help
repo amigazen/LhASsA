@@ -1,0 +1,210 @@
+   NAME
+	LhA - Create, list, test, and extract LHA/LZH archives.
+
+   FORMAT
+	LhA [-<options>] <command> <archive[.LHA|.LZH]> [[homedir]
+	     <filespec>...] [@file] [destdir]
+
+   TEMPLATE
+	(Classic LhA-style CLI; not AmigaDOS ReadArgs.)
+	[-options] COMMAND ARCHIVE [filespec...] [destdir]
+
+   PATH
+	C:LhA
+
+   FUNCTION
+	LhA is the LhASsA command-line archiver. It uses the same
+	command letters and option letters as classic Amiga LhA 2.15,
+	so existing scripts and muscle memory continue to work. Archives
+	are written and read through the LhASsA LHA engine (.lha / .lzh
+	header levels 0-2, CRC16, lh0/lh1/lh5/lh6/lh7 and related
+	methods).
+
+	The first argument after any leading options is a single-letter
+	(or short multi-letter) <command>. The next argument is the
+	archive path (AmigaDOS wildcards allowed except for m). Further
+	arguments are filespecs, optional home-directory prefixes, and
+	an optional destination directory for extract. Destination
+	directories must end with a slash (/) or a colon (:).
+
+	Without other options, LhA reports progress in the classic
+	console style (Freezing/Frozen on add; extract/test progress)
+	and prints Operation successful. when a command finishes
+	cleanly.
+
+	ENV:LHAOPTS is applied at startup as if those options were typed
+	after the program name. Use -I to ignore it.
+
+   COMMANDS
+	a
+	    Add file(s) to an archive (create or append). Existing
+	    members with the same name are skipped with a warning
+	    (classic behaviour). Use -Qq to skip the duplicate scan.
+	    Default stores basenames only; -x (or -r) stores paths.
+
+	c
+	    Concatenate / append other archive(s) into the named archive.
+
+	d
+	    Delete file(s) from an archive.
+
+	e
+	    Extract file(s) using base names only (no stored paths).
+
+	f
+	    Freshen file(s) already in the archive (accepted for
+	    compatibility; not yet implemented in LhASsA).
+
+	h
+	    Hunt for differences between archive and filesystem
+	    (accepted; not yet implemented).
+
+	l / lq
+	    List archive contents (terse). lq is quiet list.
+
+	m
+	    Move file(s) into the archive (accepted; not yet implemented).
+	    ARCHIVE must be a single concrete path (no wildcards).
+
+	p
+	    Print file(s) from the archive to the current output.
+
+	r
+	    Replace file(s) in the archive (accepted; not yet implemented).
+
+	t
+	    Test archive integrity (CRC check of stored data).
+
+	u
+	    Update file(s) in the archive (accepted; not yet implemented).
+
+	v / vq / vv
+	    List archive contents (verbose). vq is quiet verbose list;
+	    vv shows full detail.
+
+	x
+	    Extract file(s) with full stored path names.
+
+	y
+	    Copy archive with new options (accepted; not yet implemented).
+
+   HOME DIRECTORIES
+	A filespec ending in / or : is treated as a home directory
+	prefix for following filespecs (until the next home or /).
+	Stored paths omit the home prefix when -x is active. A lone /
+	resets the home to the current directory. -h disables home-
+	directory recognition.
+
+   OPTIONS
+	Options are case-sensitive and may appear anywhere on the
+	command line. A letter followed by 0 disables the option; any
+	other digit enables it. A bare letter enables the option.
+	Default compression is LHA V2.x-style (-lh5-).
+
+	Implemented / commonly used:
+
+	-q
+	    Quiet output (also lq / vq command forms).
+
+	-x
+	    Preserve and use path names when adding or extracting.
+	    Enabled automatically by -r; use -x0 to store basenames
+	    only while still recursing.
+
+	-r
+	    Collect action files recursively. Enables -x unless -x0
+	    follows. Explicit names are looked up only in the home
+	    directory; patterns match in all subdirectories.
+
+	-R
+	    Collect archive files recursively for list/extract/test
+	    and similar commands.
+
+	-e
+	    With -r, archive empty directories as -lhd- members.
+
+	-f
+	    Ignore Amiga filenotes (do not store or restore comments).
+
+	-h
+	    Disable home-directory recognition.
+
+	-z
+	    Store files without compression (lh0).
+
+	-0 / -1 / -2
+	    Write header level 0, 1, or 2 when creating entries.
+
+	-2 / -3
+	    Use -lh5- / -lh6- compression when adding (default -lh5-).
+
+	-n / -N
+	    Suppress byte progress / all progress indicators.
+
+	-X
+	    Do not append .lha/.lzh if the archive name has no suffix.
+
+	-y
+	    Always append .lha/.lzh.
+
+	-I
+	    Ignore ENV:LHAOPTS.
+
+	-Qq
+	    Quick add: do not scan for duplicate members before add.
+
+	-Qw
+	    Disable AmigaDOS wildcard expansion.
+
+	-Qd
+	    Delete autoshow (.displayme) files after showing them.
+
+	w=<dir>
+	    Work / extract directory (trailing / or : required for
+	    destination directories on extract).
+
+	Many other classic LhA 2.15 switches are parsed for script
+	compatibility and are currently no-ops or only partially
+	honoured (for example -a, -A, -B, -c, -C, -E, -s, -S, -t, -T,
+	-V, -W). Password-protected and self-extracting archives, and
+	multivolume (-V / -Qv), are not supported. See the LhASsA
+	README for the full compatibility matrix.
+
+   EXAMPLES
+	    1> LhA a Backup:Work.lha Work:Sources/#?
+
+	Creates or updates Work.lha, adding matching files (basenames).
+
+	    1> LhA -x a Project.lha Work:MyProject/#?
+
+	Adds matching files with stored path names (volume stripped).
+
+	    1> LhA -r a Src.lha hd:tmp/ *.c *.h
+
+	Recursively adds .c and .h under hd:tmp/, storing paths relative
+	to that home directory.
+
+	    1> LhA -R l RAM:#?.lha
+
+	Lists every matching archive under RAM: (recursive collect).
+
+	    1> LhA v Project.lha
+
+	Verbose listing of archive members.
+
+	    1> LhA x Project.lha RAM:Out/
+
+	Extracts into RAM:Out/ with full paths (x). Use e to flatten
+	names.
+
+	    1> LhA t Backup:Work.lha
+
+	Tests CRC integrity of every member.
+
+	    1> LhA c All.lha Part1.lha Part2.lha
+
+	Concatenates Part1.lha and Part2.lha into All.lha. Use a to
+	add ordinary files; do not use c for that.
+
+   SEE ALSO
+	LhX, Load, Handle

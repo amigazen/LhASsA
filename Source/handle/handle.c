@@ -5,13 +5,14 @@
  *
  * handle.c - Handle: create a Bin-profile LHA from a stage directory.
  *
- * LHA = Load / Handle / Archive.  FROM named SYS => system package mode;
- * otherwise application package mode.  Output name-version.lha from NAME,
- * PRIMARY ($VER), and optional VERSION= override.
+ * LHA = Load / Handle / Archive.  FROM named SYS => system package (map
+ * stems to assigns / SYS:); any other FROM name => application package
+ * (ordinary folder names under InstallRoot).
  */
 
 #include <exec/types.h>
 #include <exec/execbase.h>
+#include <exec/memory.h>
 #include <dos/dos.h>
 #include <dos/rdargs.h>
 #include <proto/exec.h>
@@ -24,6 +25,7 @@ struct Library *UtilityBase = NULL;
 #include <proto/lh.h>
 
 #include "handle_internal.h"
+#include "/common/lhasa_cmdhelp.h"
 
 extern struct ExecBase *SysBase;
 extern struct DosLibrary *DOSBase;
@@ -31,15 +33,16 @@ extern struct DosLibrary *DOSBase;
 struct Library *LhBase = NULL;
 
 static const char *verstag = "$VER: Handle 1.1 (23.07.2026)\n";
-static const char *stack_cookie = "$STACK: 40960\n";
+/* 4K -- HandleArgs / HandleScan / recursive path pairs are heap. */
+static const char *stack_cookie = "$STACK: 4096\n";
 const long oslibversion = 37L;
 
 #define HANDLE_NARGS 8
 
 static const char *TEMPLATE =
-    "FROM/A,"
-    "NAME/A,"
-    "PRIMARY/A,"
+    "FROM,"
+    "NAME,"
+    "PRIMARY,"
     "VERSION/K,"
     "OUT/K,"
     "FORCE/S,"
@@ -149,20 +152,44 @@ static int handle_open_libs(void)
 int main(int argc, char *argv[])
 {
     struct RDArgs *rda;
-    struct HandleArgs args;
-    LONG rdargs[HANDLE_NARGS];
+    struct HandleArgs *args;
+    LONG *rdargs;
     LONG rc;
     LONG i;
+    ULONG args_sz;
+    ULONG rd_sz;
 
     (void)argc;
     (void)argv;
     (void)verstag;
     (void)stack_cookie;
 
+    args = NULL;
+    rdargs = NULL;
+    rda = NULL;
+    rc = RETURN_FAIL;
+    args_sz = (ULONG)sizeof(struct HandleArgs);
+    rd_sz = (ULONG)sizeof(LONG) * (ULONG)HANDLE_NARGS;
+
     if (!handle_open_libs()) {
         if (DOSBase) {
             handle_print_error((STRPTR)"cannot open utility.library", 0);
         }
+        return RETURN_FAIL;
+    }
+
+    /* HandleArgs embeds ~2KB of path buffers -- heap, not stack. */
+    args = (struct HandleArgs *)AllocMem(args_sz, MEMF_PUBLIC | MEMF_CLEAR);
+    rdargs = (LONG *)AllocMem(rd_sz, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!args || !rdargs) {
+        if (args) {
+            FreeMem(args, args_sz);
+        }
+        if (rdargs) {
+            FreeMem(rdargs, rd_sz);
+        }
+        handle_print_error((STRPTR)"out of memory", 0);
+        handle_set_rc(RETURN_FAIL);
         return RETURN_FAIL;
     }
 
@@ -180,43 +207,60 @@ int main(int argc, char *argv[])
         } else {
             handle_print_usage();
         }
+        FreeMem(args, args_sz);
+        FreeMem(rdargs, rd_sz);
         handle_set_rc(RETURN_FAIL);
         return RETURN_FAIL;
     }
 
-    handle_args_from_rd(&args, rdargs);
+    handle_args_from_rd(args, rdargs);
 
-    if (args.help) {
-        handle_print_usage();
+    if (args->help) {
+        if (lhasa_print_cmd_help((STRPTR)"Handle")) {
+            FreeArgs(rda);
+            FreeMem(args, args_sz);
+            FreeMem(rdargs, rd_sz);
+            handle_set_rc(RETURN_OK);
+            return RETURN_OK;
+        }
         FreeArgs(rda);
-        handle_set_rc(RETURN_OK);
-        return RETURN_OK;
+        FreeMem(args, args_sz);
+        FreeMem(rdargs, rd_sz);
+        handle_set_rc(RETURN_FAIL);
+        return RETURN_FAIL;
     }
 
-    if (!args.from || !args.from[0] || !args.name || !args.name[0]
-        || !args.primary || !args.primary[0]) {
+    if (!args->from || !args->from[0] || !args->name || !args->name[0]
+        || !args->primary || !args->primary[0]) {
         handle_print_error((STRPTR)"FROM, NAME, and PRIMARY are required", 0);
-        handle_print_usage();
+        Printf("Handle: type Handle HELP for documentation.\n", 0);
+        Flush(Output());
         FreeArgs(rda);
+        FreeMem(args, args_sz);
+        FreeMem(rdargs, rd_sz);
         handle_set_rc(RETURN_FAIL);
         return RETURN_FAIL;
     }
 
-    handle_stabilize_args(&args);
+    handle_stabilize_args(args);
     FreeArgs(rda);
     rda = NULL;
+    FreeMem(rdargs, rd_sz);
+    rdargs = NULL;
 
     LhBase = OpenLibrary((STRPTR)LH_NAME, (LONG)LH_MIN_VERSION);
     if (!LhBase) {
         handle_print_error((STRPTR)"cannot open lh.library", 0);
+        FreeMem(args, args_sz);
         handle_set_rc(RETURN_FAIL);
         return RETURN_FAIL;
     }
 
-    rc = handle_run(&args);
+    rc = handle_run(args);
 
     CloseLibrary(LhBase);
     LhBase = NULL;
+    FreeMem(args, args_sz);
     handle_set_rc(rc);
     return (int)rc;
 }

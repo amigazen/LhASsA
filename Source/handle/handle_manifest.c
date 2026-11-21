@@ -5,13 +5,20 @@
  *
  * handle_manifest.c - Scan stage and generate Manifest text.
  *
- * System mode (FROM directory named SYS):
- *   FROM/Libs/foo.library
- *   FROM/Libs/foo.library.020.881
- *   FROM/Manifest   (optional: Summary, OS, Requires)
+ * System package (FROM directory named SYS):
+ *   FROM/SDK/...     -> SDK:
+ *   FROM/Libs/...    -> LIBS:
+ *   FROM/Classes/... -> SYS:Classes/
+ *   FROM/Prefs/...   -> SYS:Prefs/
+ *   FROM/Tools/...   -> SYS:Tools/
+ *   FROM/Devs|L|C|Locale|Help|... -> LOCALE: / LOCALE:Help/ / assigns
+ *   Archive members use a SYS/ prefix (SYS/Libs/...).
  *
- * Application mode (any other FROM name):
- *   FROM/MyApp, FROM/data/..., optional FROM/Manifest
+ * Application package (any other FROM name):
+ *   Tree packed as-is; destinations are InstallRoot-relative folder names.
+ *   Top-level Libs/, SDK/, etc. are NOT remapped -- they stay ordinary drawers.
+ *
+ * Optional FROM/Manifest supplies Summary/OS/Requires only.
  */
 
 #include <exec/types.h>
@@ -72,69 +79,105 @@ static void handle_append_ulong(STRPTR dst, LONG dstlen, ULONG v)
     dst[L] = '\0';
 }
 
+static void handle_append_2dig(STRPTR dst, LONG dstlen, ULONG v)
+{
+    char tmp[3];
+
+    tmp[0] = (char)('0' + ((v / 10UL) % 10UL));
+    tmp[1] = (char)('0' + (v % 10UL));
+    tmp[2] = '\0';
+    handle_str_cat(dst, dstlen, (STRPTR)tmp);
+}
+
 /*
- * Map SYS/<stem>/... to assign stem (LIBS, Devs, CLASSES, ...).
- * Returns 0 if stem is not a known SYS subdirectory.
+ * Map a stage top-level drawer to a Manifest destination prefix.
+ * Prefs/Tools/Classes are not assigns -- they live under SYS:.
+ * Returns 0 if stem is application content (InstallRoot-relative).
  */
 static LONG handle_sys_stem_assign(STRPTR stem, STRPTR out, LONG outlen)
 {
     if (!stem || !out || outlen <= 0) {
         return 0;
     }
+    if (Stricmp(stem, (STRPTR)"SDK") == 0) {
+        Strncpy(out, (STRPTR)"SDK:", outlen);
+        return 1;
+    }
     if (Stricmp(stem, (STRPTR)"Libs") == 0
         || Stricmp(stem, (STRPTR)"LIBS") == 0) {
-        Strncpy(out, (STRPTR)"LIBS", outlen);
+        Strncpy(out, (STRPTR)"LIBS:", outlen);
         return 1;
     }
     if (Stricmp(stem, (STRPTR)"C") == 0) {
-        Strncpy(out, (STRPTR)"C", outlen);
+        Strncpy(out, (STRPTR)"C:", outlen);
         return 1;
     }
     if (Stricmp(stem, (STRPTR)"Devs") == 0
         || Stricmp(stem, (STRPTR)"DEVS") == 0) {
-        Strncpy(out, (STRPTR)"Devs", outlen);
+        Strncpy(out, (STRPTR)"Devs:", outlen);
         return 1;
     }
     if (Stricmp(stem, (STRPTR)"L") == 0) {
-        Strncpy(out, (STRPTR)"L", outlen);
+        Strncpy(out, (STRPTR)"L:", outlen);
         return 1;
     }
+    /* Prefs: / Tools: are not valid assigns on classic Amiga. */
     if (Stricmp(stem, (STRPTR)"Prefs") == 0) {
-        Strncpy(out, (STRPTR)"Prefs", outlen);
+        Strncpy(out, (STRPTR)"SYS:Prefs/", outlen);
+        return 1;
+    }
+    if (Stricmp(stem, (STRPTR)"Tools") == 0) {
+        Strncpy(out, (STRPTR)"SYS:Tools/", outlen);
+        return 1;
+    }
+    /* Classes maps to SYS:Classes (not a CLASSES: assign). */
+    if (Stricmp(stem, (STRPTR)"Classes") == 0
+        || Stricmp(stem, (STRPTR)"CLASSES") == 0) {
+        Strncpy(out, (STRPTR)"SYS:Classes/", outlen);
         return 1;
     }
     if (Stricmp(stem, (STRPTR)"Fonts") == 0) {
-        Strncpy(out, (STRPTR)"Fonts", outlen);
+        Strncpy(out, (STRPTR)"Fonts:", outlen);
         return 1;
     }
     if (Stricmp(stem, (STRPTR)"Expansion") == 0) {
-        Strncpy(out, (STRPTR)"Expansion", outlen);
+        Strncpy(out, (STRPTR)"Expansion:", outlen);
         return 1;
     }
+    /*
+     * SYS:Locale is the LOCALE: assign.  Help lives under LOCALE:Help
+     * (HELP: is normally an assign to that drawer).
+     */
     if (Stricmp(stem, (STRPTR)"Locale") == 0) {
-        Strncpy(out, (STRPTR)"Locale", outlen);
+        Strncpy(out, (STRPTR)"LOCALE:", outlen);
+        return 1;
+    }
+    if (Stricmp(stem, (STRPTR)"Help") == 0
+        || Stricmp(stem, (STRPTR)"HELP") == 0) {
+        Strncpy(out, (STRPTR)"LOCALE:Help/", outlen);
         return 1;
     }
     if (Stricmp(stem, (STRPTR)"System") == 0) {
-        Strncpy(out, (STRPTR)"System", outlen);
+        Strncpy(out, (STRPTR)"System:", outlen);
         return 1;
     }
     if (Stricmp(stem, (STRPTR)"S") == 0) {
-        Strncpy(out, (STRPTR)"S", outlen);
-        return 1;
-    }
-    if (Stricmp(stem, (STRPTR)"Classes") == 0
-        || Stricmp(stem, (STRPTR)"CLASSES") == 0) {
-        Strncpy(out, (STRPTR)"CLASSES", outlen);
+        Strncpy(out, (STRPTR)"S:", outlen);
         return 1;
     }
     return 0;
 }
 
+/*
+ * Record one File: line.  disk_path is the staged file on disk -- scanned
+ * for $VER: so Load can gate without extracting candidates later.
+ * Missing/unparseable $VER: is OK (data files); Ver= is simply omitted.
+ */
 static LONG handle_add_file(struct HandleScan *scan, STRPTR dest,
-    STRPTR from, const struct HandleVariant *v)
+    STRPTR from, STRPTR disk_path, const struct HandleVariant *v)
 {
     struct HandleFileVar *fv;
+    struct HandleVerInfo vi;
 
     if (scan->nfiles >= HANDLE_MAX_FILES) {
         handle_print_error((STRPTR)"too many staged files", 0);
@@ -149,69 +192,102 @@ static LONG handle_add_file(struct HandleScan *scan, STRPTR dest,
     fv->mmu = v->mmu;
     fv->wos = v->wos;
     fv->pup = v->pup;
+    fv->have_ver = 0;
+    fv->have_date = 0;
+    fv->major = 0;
+    fv->minor = 0;
+    fv->ymd = 0;
+    handle_ver_clear(&vi);
+    if (disk_path && disk_path[0]
+        && handle_ver_scan_file(disk_path, &vi) && vi.have_ver) {
+        fv->have_ver = 1;
+        fv->have_date = vi.have_date;
+        fv->major = vi.major;
+        fv->minor = vi.minor;
+        fv->ymd = vi.ymd;
+    }
     scan->nfiles++;
     return 1;
 }
 
 /*
- * Walk under SYS/<stem>/... ; dest_prefix is like LIBS: or LIBS:subdir/
- * arc_rel is SYS/Libs/...
+ * Walk under a system stem; dest_prefix is like LIBS: or SYS:Classes/
+ * arc_rel is Libs/... or SYS/Libs/...
  */
 static LONG handle_walk_sys_tree(struct HandleScan *scan, BPTR dir_lock,
     STRPTR disk_dir, STRPTR arc_rel, STRPTR dest_prefix)
 {
     struct FileInfoBlock *fib;
-    char child_disk[HANDLE_PATH_LEN];
-    char child_arc[HANDLE_PATH_LEN];
-    char child_dest[HANDLE_VAL_LEN];
-    char base_leaf[HANDLE_VAL_LEN];
+    STRPTR child_disk;
+    STRPTR child_arc;
+    STRPTR child_dest;
+    STRPTR base_leaf;
     struct HandleVariant var;
     BPTR child_lock;
+    LONG ok;
 
+    /*
+     * Recursive: path buffers must be heap so deep trees do not blow the
+     * 4K stack (two PATH + two VAL per frame).
+     */
+    child_disk = (STRPTR)AllocMem(HANDLE_PATH_LEN, MEMF_PUBLIC | MEMF_CLEAR);
+    child_arc = (STRPTR)AllocMem(HANDLE_PATH_LEN, MEMF_PUBLIC | MEMF_CLEAR);
+    child_dest = (STRPTR)AllocMem(HANDLE_VAL_LEN, MEMF_PUBLIC | MEMF_CLEAR);
+    base_leaf = (STRPTR)AllocMem(HANDLE_VAL_LEN, MEMF_PUBLIC | MEMF_CLEAR);
     fib = (struct FileInfoBlock *)AllocMem(
         (ULONG)sizeof(struct FileInfoBlock), MEMF_PUBLIC | MEMF_CLEAR);
-    if (!fib) {
+    if (!child_disk || !child_arc || !child_dest || !base_leaf || !fib) {
+        if (child_disk) {
+            FreeMem(child_disk, HANDLE_PATH_LEN);
+        }
+        if (child_arc) {
+            FreeMem(child_arc, HANDLE_PATH_LEN);
+        }
+        if (child_dest) {
+            FreeMem(child_dest, HANDLE_VAL_LEN);
+        }
+        if (base_leaf) {
+            FreeMem(base_leaf, HANDLE_VAL_LEN);
+        }
+        if (fib) {
+            FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+        }
         return 0;
     }
+    ok = 0;
     if (!Examine(dir_lock, fib) || fib->fib_DirEntryType <= 0) {
-        FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-        return 0;
+        goto out;
     }
     while (ExNext(dir_lock, fib)) {
         if (handle_is_hidden_name(fib->fib_FileName)) {
             continue;
         }
-        if (!handle_path_join((STRPTR)child_disk, HANDLE_PATH_LEN, disk_dir,
+        if (!handle_path_join(child_disk, HANDLE_PATH_LEN, disk_dir,
                 fib->fib_FileName)) {
-            FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-            return 0;
+            goto out;
         }
-        if (!handle_arc_join((STRPTR)child_arc, HANDLE_PATH_LEN, arc_rel,
+        if (!handle_arc_join(child_arc, HANDLE_PATH_LEN, arc_rel,
                 fib->fib_FileName)) {
-            FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-            return 0;
+            goto out;
         }
 
         if (fib->fib_DirEntryType > 0) {
-            Strncpy((STRPTR)child_dest, dest_prefix, HANDLE_VAL_LEN);
-            handle_str_cat((STRPTR)child_dest, HANDLE_VAL_LEN,
-                fib->fib_FileName);
-            handle_str_cat((STRPTR)child_dest, HANDLE_VAL_LEN, (STRPTR)"/");
-            child_lock = Lock((STRPTR)child_disk, ACCESS_READ);
+            Strncpy(child_dest, dest_prefix, HANDLE_VAL_LEN);
+            handle_str_cat(child_dest, HANDLE_VAL_LEN, fib->fib_FileName);
+            handle_str_cat(child_dest, HANDLE_VAL_LEN, (STRPTR)"/");
+            child_lock = Lock(child_disk, ACCESS_READ);
             if (!child_lock) {
-                FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-                return 0;
+                goto out;
             }
-            if (!handle_walk_sys_tree(scan, child_lock, (STRPTR)child_disk,
-                    (STRPTR)child_arc, (STRPTR)child_dest)) {
+            if (!handle_walk_sys_tree(scan, child_lock, child_disk,
+                    child_arc, child_dest)) {
                 UnLock(child_lock);
-                FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-                return 0;
+                goto out;
             }
             UnLock(child_lock);
         } else {
             if (!handle_variant_parse_leaf(fib->fib_FileName,
-                    (STRPTR)base_leaf, HANDLE_VAL_LEN, &var)) {
+                    base_leaf, HANDLE_VAL_LEN, &var)) {
                 handle_print_error(
                     (STRPTR)"unknown or bad secondary extension on staged file",
                     0);
@@ -219,30 +295,31 @@ static LONG handle_walk_sys_tree(struct HandleScan *scan, BPTR dir_lock,
                 Printf("Handle:   allowed: .020 .030 .040 .060 .881 .882 .mmu .wos .pup\n",
                     0);
                 Flush(Output());
-                FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-                return 0;
+                goto out;
             }
             if (var.wos && var.pup) {
                 handle_print_error((STRPTR)".wos and .pup cannot combine", 0);
-                FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-                return 0;
+                goto out;
             }
-            Strncpy((STRPTR)child_dest, dest_prefix, HANDLE_VAL_LEN);
-            handle_str_cat((STRPTR)child_dest, HANDLE_VAL_LEN,
-                (STRPTR)base_leaf);
-            if (!handle_add_file(scan, (STRPTR)child_dest, (STRPTR)child_arc,
+            Strncpy(child_dest, dest_prefix, HANDLE_VAL_LEN);
+            handle_str_cat(child_dest, HANDLE_VAL_LEN, base_leaf);
+            if (!handle_add_file(scan, child_dest, child_arc, child_disk,
                     &var)) {
-                FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-                return 0;
+                goto out;
             }
         }
     }
     if (IoErr() != ERROR_NO_MORE_ENTRIES) {
-        FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-        return 0;
+        goto out;
     }
+    ok = 1;
+out:
     FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-    return 1;
+    FreeMem(base_leaf, HANDLE_VAL_LEN);
+    FreeMem(child_dest, HANDLE_VAL_LEN);
+    FreeMem(child_arc, HANDLE_PATH_LEN);
+    FreeMem(child_disk, HANDLE_PATH_LEN);
+    return ok;
 }
 
 static LONG handle_walk_sys_root(struct HandleScan *scan, BPTR sys_lock,
@@ -286,7 +363,6 @@ static LONG handle_walk_sys_root(struct HandleScan *scan, BPTR sys_lock,
             return 0;
         }
         Strncpy((STRPTR)dest_prefix, (STRPTR)assign, HANDLE_VAL_LEN);
-        handle_str_cat((STRPTR)dest_prefix, HANDLE_VAL_LEN, (STRPTR)":");
 
         child_lock = Lock((STRPTR)child_disk, ACCESS_READ);
         if (!child_lock) {
@@ -368,21 +444,42 @@ static LONG handle_walk_app_tree(struct HandleScan *scan, BPTR dir_lock,
     STRPTR disk_dir, STRPTR arc_rel)
 {
     struct FileInfoBlock *fib;
-    char child_disk[HANDLE_PATH_LEN];
-    char child_arc[HANDLE_PATH_LEN];
-    char child_dest[HANDLE_VAL_LEN];
-    char base_leaf[HANDLE_VAL_LEN];
+    STRPTR child_disk;
+    STRPTR child_arc;
+    STRPTR child_dest;
+    STRPTR base_leaf;
     struct HandleVariant var;
     BPTR child_lock;
+    LONG ok;
 
+    /* Recursive -- heap path buffers (see handle_walk_sys_tree). */
+    child_disk = (STRPTR)AllocMem(HANDLE_PATH_LEN, MEMF_PUBLIC | MEMF_CLEAR);
+    child_arc = (STRPTR)AllocMem(HANDLE_PATH_LEN, MEMF_PUBLIC | MEMF_CLEAR);
+    child_dest = (STRPTR)AllocMem(HANDLE_VAL_LEN, MEMF_PUBLIC | MEMF_CLEAR);
+    base_leaf = (STRPTR)AllocMem(HANDLE_VAL_LEN, MEMF_PUBLIC | MEMF_CLEAR);
     fib = (struct FileInfoBlock *)AllocMem(
         (ULONG)sizeof(struct FileInfoBlock), MEMF_PUBLIC | MEMF_CLEAR);
-    if (!fib) {
+    if (!child_disk || !child_arc || !child_dest || !base_leaf || !fib) {
+        if (child_disk) {
+            FreeMem(child_disk, HANDLE_PATH_LEN);
+        }
+        if (child_arc) {
+            FreeMem(child_arc, HANDLE_PATH_LEN);
+        }
+        if (child_dest) {
+            FreeMem(child_dest, HANDLE_VAL_LEN);
+        }
+        if (base_leaf) {
+            FreeMem(base_leaf, HANDLE_VAL_LEN);
+        }
+        if (fib) {
+            FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+        }
         return 0;
     }
+    ok = 0;
     if (!Examine(dir_lock, fib) || fib->fib_DirEntryType <= 0) {
-        FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-        return 0;
+        goto out;
     }
     while (ExNext(dir_lock, fib)) {
         if (handle_is_hidden_name(fib->fib_FileName)) {
@@ -392,33 +489,29 @@ static LONG handle_walk_app_tree(struct HandleScan *scan, BPTR dir_lock,
             && arc_rel[0] == '\0') {
             continue;
         }
-        if (!handle_path_join((STRPTR)child_disk, HANDLE_PATH_LEN, disk_dir,
+        if (!handle_path_join(child_disk, HANDLE_PATH_LEN, disk_dir,
                 fib->fib_FileName)) {
-            FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-            return 0;
+            goto out;
         }
-        if (!handle_arc_join((STRPTR)child_arc, HANDLE_PATH_LEN, arc_rel,
+        if (!handle_arc_join(child_arc, HANDLE_PATH_LEN, arc_rel,
                 fib->fib_FileName)) {
-            FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-            return 0;
+            goto out;
         }
 
         if (fib->fib_DirEntryType > 0) {
-            child_lock = Lock((STRPTR)child_disk, ACCESS_READ);
+            child_lock = Lock(child_disk, ACCESS_READ);
             if (!child_lock) {
-                FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-                return 0;
+                goto out;
             }
-            if (!handle_walk_app_tree(scan, child_lock, (STRPTR)child_disk,
-                    (STRPTR)child_arc)) {
+            if (!handle_walk_app_tree(scan, child_lock, child_disk,
+                    child_arc)) {
                 UnLock(child_lock);
-                FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-                return 0;
+                goto out;
             }
             UnLock(child_lock);
         } else {
             if (!handle_variant_parse_leaf(fib->fib_FileName,
-                    (STRPTR)base_leaf, HANDLE_VAL_LEN, &var)) {
+                    base_leaf, HANDLE_VAL_LEN, &var)) {
                 handle_print_error(
                     (STRPTR)"unknown or bad secondary extension on staged file",
                     0);
@@ -426,36 +519,37 @@ static LONG handle_walk_app_tree(struct HandleScan *scan, BPTR dir_lock,
                 Printf("Handle:   allowed: .020 .030 .040 .060 .881 .882 .mmu .wos .pup\n",
                     0);
                 Flush(Output());
-                FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-                return 0;
+                goto out;
             }
             if (var.wos && var.pup) {
                 handle_print_error((STRPTR)".wos and .pup cannot combine", 0);
-                FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-                return 0;
+                goto out;
             }
             if (arc_rel[0] != '\0') {
-                if (!handle_arc_join((STRPTR)child_dest, HANDLE_VAL_LEN,
-                        arc_rel, (STRPTR)base_leaf)) {
-                    FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-                    return 0;
+                if (!handle_arc_join(child_dest, HANDLE_VAL_LEN,
+                        arc_rel, base_leaf)) {
+                    goto out;
                 }
             } else {
-                Strncpy((STRPTR)child_dest, (STRPTR)base_leaf, HANDLE_VAL_LEN);
+                Strncpy(child_dest, base_leaf, HANDLE_VAL_LEN);
             }
-            if (!handle_add_file(scan, (STRPTR)child_dest, (STRPTR)child_arc,
+            if (!handle_add_file(scan, child_dest, child_arc, child_disk,
                     &var)) {
-                FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-                return 0;
+                goto out;
             }
         }
     }
     if (IoErr() != ERROR_NO_MORE_ENTRIES) {
-        FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-        return 0;
+        goto out;
     }
+    ok = 1;
+out:
     FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-    return 1;
+    FreeMem(base_leaf, HANDLE_VAL_LEN);
+    FreeMem(child_dest, HANDLE_VAL_LEN);
+    FreeMem(child_arc, HANDLE_PATH_LEN);
+    FreeMem(child_disk, HANDLE_PATH_LEN);
+    return ok;
 }
 
 static LONG handle_path_has_colon(STRPTR path)
@@ -698,40 +792,6 @@ static LONG handle_set_package_version(struct HandleArgs *args,
     return 1;
 }
 
-static LONG handle_check_sys_ver_uniform(struct HandleScan *scan,
-    STRPTR from_root, ULONG pkg_maj, ULONG pkg_min)
-{
-    LONG i;
-    struct HandleVerInfo vi;
-    char disk_path[HANDLE_PATH_LEN];
-
-    for (i = 0; i < scan->nfiles; i++) {
-        if (!handle_disk_from_arc((STRPTR)disk_path, HANDLE_PATH_LEN,
-                from_root, scan->files[i].from, scan->sys_mode)) {
-            return 0;
-        }
-        if (!handle_ver_scan_file((STRPTR)disk_path, &vi)) {
-            handle_print_error(
-                (STRPTR)"staged file missing or unparseable $VER:", 0);
-            Printf("Handle:   %s\n", (LONG)disk_path);
-            Printf("Handle:   need $VER: name maj.min [(dd.mm.yy|dd/mm/yy)]\n",
-                0);
-            Flush(Output());
-            return 0;
-        }
-        if (vi.major != pkg_maj || vi.minor != pkg_min) {
-            handle_print_error(
-                (STRPTR)"binary $VER does not match PRIMARY package version",
-                0);
-            Printf("Handle:   %s is %ld.%ld, package is %ld.%ld\n",
-                (LONG)disk_path, vi.major, vi.minor, pkg_maj, pkg_min);
-            Flush(Output());
-            return 0;
-        }
-    }
-    return 1;
-}
-
 static void handle_skip_ws(STRPTR *pp)
 {
     while (**pp == ' ' || **pp == '\t') {
@@ -953,6 +1013,7 @@ LONG handle_scan_stage(struct HandleArgs *args, struct HandleScan *scan)
     }
 
     if (args->sys_mode) {
+        /* FROM named SYS: map Libs/ Devs/ Classes/... to system destinations. */
         if (!handle_walk_sys_root(scan, from_lock, args->from_path,
                 (STRPTR)"SYS")) {
             UnLock(from_lock);
@@ -967,6 +1028,7 @@ LONG handle_scan_stage(struct HandleArgs *args, struct HandleScan *scan)
             return 0;
         }
     } else {
+        /* Any other FROM name: ordinary drawers/files under InstallRoot. */
         if (!handle_walk_app_tree(scan, from_lock, args->from_path,
                 (STRPTR)"")) {
             UnLock(from_lock);
@@ -988,18 +1050,12 @@ LONG handle_scan_stage(struct HandleArgs *args, struct HandleScan *scan)
         Strncpy(scan->summary, (STRPTR)"generated by Handle", HANDLE_VAL_LEN);
     }
 
+    /* Package Version is PRIMARY (or VERSION=) only; other files may differ. */
     pkg_maj = 0;
     pkg_min = 0;
     if (!handle_set_package_version(args, scan, args->from_path,
             &pkg_maj, &pkg_min)) {
         return 0;
-    }
-
-    if (args->sys_mode) {
-        if (!handle_check_sys_ver_uniform(scan, args->from_path,
-                pkg_maj, pkg_min)) {
-            return 0;
-        }
     }
 
     return 1;
@@ -1024,12 +1080,29 @@ LONG handle_build_manifest(struct HandleScan *scan, STRPTR out, LONG outlen)
         handle_str_cat(out, outlen, scan->os_min);
         handle_str_cat(out, outlen, (STRPTR)"\n");
     }
-    if (scan->sys_mode) {
-        handle_str_cat(out, outlen, (STRPTR)"InstallRoot: Work:\n");
-    } else {
-        handle_str_cat(out, outlen, (STRPTR)"InstallRoot: Work:");
-        handle_str_cat(out, outlen, scan->name);
-        handle_str_cat(out, outlen, (STRPTR)"/\n");
+    /*
+     * InstallRoot applies only to relative File: destinations (application
+     * content). Absolute assign paths (SDK:, LIBS:, ...) ignore it. Default
+     * app drawer is Work:Name/ (override at Load with TO=Work:Apps/Name/).
+     */
+    {
+        LONG has_rel;
+
+        has_rel = 0;
+        for (i = 0; i < scan->nfiles; i++) {
+            if (scan->files[i].dest[0]
+                && !handle_path_has_colon(scan->files[i].dest)) {
+                has_rel = 1;
+                break;
+            }
+        }
+        if (has_rel) {
+            handle_str_cat(out, outlen, (STRPTR)"InstallRoot: Work:");
+            handle_str_cat(out, outlen, scan->name);
+            handle_str_cat(out, outlen, (STRPTR)"/\n");
+        } else {
+            handle_str_cat(out, outlen, (STRPTR)"InstallRoot: Work:\n");
+        }
     }
     handle_str_cat(out, outlen, (STRPTR)"Summary: ");
     handle_str_cat(out, outlen, scan->summary);
@@ -1063,7 +1136,128 @@ LONG handle_build_manifest(struct HandleScan *scan, STRPTR out, LONG outlen)
         if (scan->files[i].mmu) {
             handle_str_cat(out, outlen, (STRPTR)" MMU=1");
         }
+        /*
+         * Ver= from staged $VER: so Load gates without extracting the
+         * member.  Form: Ver=major.minor or Ver=major.minor(dd.mm.yy).
+         */
+        if (scan->files[i].have_ver) {
+            ULONG day;
+            ULONG month;
+            ULONG year;
+
+            handle_str_cat(out, outlen, (STRPTR)" Ver=");
+            handle_append_ulong(out, outlen, scan->files[i].major);
+            handle_str_cat(out, outlen, (STRPTR)".");
+            handle_append_ulong(out, outlen, scan->files[i].minor);
+            if (scan->files[i].have_date) {
+                day = scan->files[i].ymd % 100UL;
+                month = (scan->files[i].ymd / 100UL) % 100UL;
+                year = scan->files[i].ymd / 10000UL;
+                if (year >= 2000UL) {
+                    year -= 2000UL;
+                } else if (year >= 1900UL) {
+                    year -= 1900UL;
+                }
+                handle_str_cat(out, outlen, (STRPTR)"(");
+                handle_append_2dig(out, outlen, day);
+                handle_str_cat(out, outlen, (STRPTR)".");
+                handle_append_2dig(out, outlen, month);
+                handle_str_cat(out, outlen, (STRPTR)".");
+                handle_append_2dig(out, outlen, year);
+                handle_str_cat(out, outlen, (STRPTR)")");
+            }
+        }
         handle_str_cat(out, outlen, (STRPTR)"\n");
     }
+    return 1;
+}
+
+/*
+ * Aminet readme fields first (Short: must lead), then Parts extensions,
+ * blank line, then install notes.  Shown by LhA autoshow and Load WB.
+ */
+LONG handle_build_displayme(struct HandleScan *scan, STRPTR out, LONG outlen)
+{
+    char shortbuf[48];
+    LONG n;
+
+    if (!scan || !out || outlen < 128) {
+        return 0;
+    }
+    out[0] = '\0';
+
+    /* Short: max 40 characters, no version/platform noise. */
+    shortbuf[0] = '\0';
+    if (scan->summary[0]
+        && Stricmp(scan->summary, (STRPTR)"generated by Handle") != 0) {
+        n = 0;
+        while (scan->summary[n] != '\0' && n < 40) {
+            shortbuf[n] = scan->summary[n];
+            n++;
+        }
+        shortbuf[n] = '\0';
+    } else if (scan->name[0]) {
+        n = 0;
+        while (scan->name[n] != '\0' && n < 36) {
+            shortbuf[n] = scan->name[n];
+            n++;
+        }
+        shortbuf[n] = '\0';
+        handle_str_cat((STRPTR)shortbuf, (LONG)sizeof(shortbuf),
+            (STRPTR)" Parts Bin");
+    } else {
+        Strncpy((STRPTR)shortbuf, (STRPTR)"LhASsA Parts Bin package", 41);
+    }
+
+    handle_str_cat(out, outlen, (STRPTR)"Short:        ");
+    handle_str_cat(out, outlen, (STRPTR)shortbuf);
+    handle_str_cat(out, outlen, (STRPTR)"\n");
+    handle_str_cat(out, outlen, (STRPTR)"Author:       amigazen project\n");
+    handle_str_cat(out, outlen, (STRPTR)"Uploader:     amigazen project\n");
+    if (scan->sys_mode) {
+        handle_str_cat(out, outlen, (STRPTR)"Type:         util/libs\n");
+    } else {
+        handle_str_cat(out, outlen, (STRPTR)"Type:         util/pack\n");
+    }
+    handle_str_cat(out, outlen, (STRPTR)"Version:      ");
+    handle_str_cat(out, outlen, scan->version);
+    handle_str_cat(out, outlen, (STRPTR)"\n");
+    handle_str_cat(out, outlen,
+        (STRPTR)"Architecture: m68k-amigaos");
+    if (scan->os_min[0]) {
+        handle_str_cat(out, outlen, (STRPTR)" >= ");
+        handle_str_cat(out, outlen, scan->os_min);
+    }
+    handle_str_cat(out, outlen, (STRPTR)"\n");
+    handle_str_cat(out, outlen, (STRPTR)"Distribution: Aminet\n");
+
+    /* Parts extension of the Aminet field block. */
+    handle_str_cat(out, outlen, (STRPTR)"Parts-Format: 1\n");
+    handle_str_cat(out, outlen, (STRPTR)"Parts-Installer: Load\n");
+    handle_str_cat(out, outlen, (STRPTR)"Parts-Name:   ");
+    handle_str_cat(out, outlen, scan->name);
+    handle_str_cat(out, outlen, (STRPTR)"\n");
+
+    handle_str_cat(out, outlen, (STRPTR)"\n");
+    handle_str_cat(out, outlen,
+        (STRPTR)
+        "This is a LhASsA Parts Bin. Install with Load -- not plain\n"
+        "LhA or LhX extract (that unpacks members, it does not place\n"
+        "system/application files).\n"
+        "\n"
+        "  Load BIN=<this archive>\n"
+        "\n"
+        "or double-click the .bin Project icon (DefaultTool Load).\n"
+        "\n"
+        "Load reads the Manifest, checks OS: and Requires:, picks the\n"
+        "best CPU/FPU/MMU/WOS/PUP variant for this machine, stages\n"
+        "candidates under SYS:T/Load, then commits (place, then\n"
+        "RemLibrary/RemDevice when safe). Absolute File: destinations\n"
+        "(LIBS:, Devs:, L:, LOCALE:Help/, ...) stay as written;\n"
+        "relative ones use InstallRoot or TO=. Per-file $VER skips\n"
+        "older or same copies unless FORCE. If anything fails, Load\n"
+        "aborts and restores from bak. ROLLBACK DEST= restores a\n"
+        "prior file from SYS:T/Load.\n");
+
     return 1;
 }

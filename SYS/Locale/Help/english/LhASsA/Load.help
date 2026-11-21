@@ -1,0 +1,123 @@
+   NAME
+	Load - Install or roll back a LhASsA Parts Bin package.
+
+   FORMAT
+	Load BIN=<archive.bin> [TO=<dir>] [FORCE] [QUIET] [VERBOSE] [HELP]
+	Load ROLLBACK DEST=<path> [QUIET] [VERBOSE] [HELP]
+
+   TEMPLATE
+	BIN,TO/K,DEST/K,FORCE/S,ROLLBACK/S,QUIET/S,VERBOSE/S,HELP/S
+
+   PATH
+	C:Load
+
+   FUNCTION
+	Load installs a Parts Bin: an LHA archive that contains a
+	Manifest, a -package.ver member, and the files to place. It
+	checks OS and Requires lines, picks the best CPU/FPU/MMU/WOS/PUP
+	variant for this machine, verifies destinations are writable and
+	not locked, then places files with backup copies under
+	SYS:T/Load. Install is two-phase (stage all candidates, then
+	commit). If any step fails, Load aborts the transaction: already
+	placed files are restored from bak, uncommitted T: candidates are
+	discarded, and destinations are left as they were. If a restore
+	cannot complete, the bak+sidecar are kept so ROLLBACK can finish
+	the job. Only one Load process may run at a time.
+
+	Absolute Manifest destinations (SDK:, LIBS:, Devs:, L:, C:,
+	LOCALE:, LOCALE:Help/, SYS:Classes/, SYS:Prefs/, SYS:Tools/,
+	...) are installed as written. Relative destinations go under
+	InstallRoot, or under TO= when given (for example Work:Apps/MyApp/).
+
+	After the new file is on disk, Load tries RemLibrary/RemDevice so
+	the next open uses it. If the module could not be cleared, Load
+	advises a reboot (exit code 5 / RETURN_WARN, including under
+	QUIET). Handlers in L: and DOSDrivers always advise a reboot.
+	Critical system modules are never removed mid-session.
+
+	ROLLBACK restores a previous file from the SYS:T/Load backup
+	for a given DEST path.
+
+	Workbench: double-click a .bin (Project icon, DefaultTool Load)
+	shows Load.displayme first (Next), then a confirmation requester
+	(requester.class when available, otherwise EasyRequest) listing
+	each destination with Manifest Ver= and whether the path already
+	exists. Workbench always opens NIL: (or CON: if VERBOSE) before
+	any console writes. The confirm button is Load; Cancel leaves the
+	system unchanged. Errors and reboot warnings use the same path.
+
+	Load.displayme is an Aminet readme extension written by Handle:
+	Short, Author, Uploader, Type, Version, Architecture,
+	Distribution, then Parts-Format / Parts-Installer / Parts-Name,
+	a blank line, and install notes. LhA autoshow shows the full
+	member. Load's WB requester does not dump the Key: value lines;
+	it uses Parts-Name (+ Version) as the title, Short/Author as
+	lead-in text, and only the prose after the blank line as the
+	body (button Next). The confirm requester uses Load|Cancel.
+
+	Only one Load may run at a time (public MsgPort LhASsA_Load).
+
+	File: Ver= from the Manifest (written by Handle from each
+	staged file's $VER:) gates upgrades by version/date. After
+	extract, Load double-checks the member's $VER: matches Ver=.
+	Members without Ver= are compared by size plus CRC16 of the
+	first and last 256 bytes; identical copies are skipped unless
+	FORCE.
+
+   OPTIONS
+	BIN=<archive.bin>
+	    Path of the Bin to install (required unless ROLLBACK).
+
+	TO=<dir>
+	    Relocate relative File: destinations only. Assign paths such
+	    as LIBS: and SDK: are never moved by TO=.
+
+	DEST=<path>
+	    With ROLLBACK, the installed path to restore from backup.
+
+	FORCE
+	    Allow overwrite when a file's own $VER says the candidate is
+	    older or the same as the installed copy. Package (Manifest)
+	    Version need not match each file. Does not force-unload
+	    resident libraries or devices.
+
+	ROLLBACK
+	    Restore DEST from SYS:T/Load instead of installing a Bin.
+
+	QUIET
+	    Reduce console output. A needed reboot still returns exit
+	    code 5. VERBOSE overrides QUIET for progress lines.
+
+	VERBOSE
+	    Print step-by-step progress (open Bin, Manifest, deps,
+	    staging, commit). From the Shell this goes to the console.
+	    From Workbench, Load opens its own CON: window. You can also
+	    set a VERBOSE ToolType on Load or on the Parts Bin icon.
+
+	HELP
+	    Print this help text from HELP:<locale>/LhASsA/Load.help
+	    (falls back to HELP:english/LhASsA/Load.help).
+
+   EXAMPLES
+	    1> Load BIN=ExampleLib.bin
+
+	Installs the Bin using Manifest destinations.
+
+	    1> Load BIN=MyApp.bin TO=Work:Apps/MyApp/
+
+	Installs application files under Work:Apps/MyApp/.
+
+	    1> Load BIN=ExampleLib.bin FORCE QUIET
+
+	Forces $VER overwrite with quiet output.
+
+	    1> Load BIN=ExampleLib.bin VERBOSE
+
+	Installs with a step-by-step console log.
+
+	    1> Load ROLLBACK DEST=LIBS:example.library
+
+	Restores the previous example.library from SYS:T/Load.
+
+   SEE ALSO
+	Handle, LhX, LhA

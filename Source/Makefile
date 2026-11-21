@@ -9,7 +9,7 @@ CPPFLAGS += -Iinclude -Isrc -Icli
 AR      ?= ar
 LHA     = lha
 
-CLISRC = cli/lha.c cli/lha_parse.c cli/lha_util.c cli/lha_cmds.c cli/lha_amiga.c
+CLISRC = cli/lha.c cli/lha_parse.c cli/lha_util.c cli/lha_cmds.c cli/lha_amiga.c cli/lha_collect.c
 CLIOBJ = $(CLISRC:.c=.o)
 
 ifeq ($(HOST),1)

@@ -356,7 +356,9 @@ static int lha_cmd_extract(const lha_args *args, int with_paths)
             } else if (!lha_write_file(outpath, entry.data, entry.data_len)) {
                 fprintf(stderr, "lha: cannot write %s\n", outpath);
             } else {
-                lha_apply_file_metadata(outpath, &entry.datetime, entry.attrs);
+                lha_apply_file_metadata_ex(outpath, &entry.datetime,
+                    entry.attrs,
+                    g_opts.ignore_filenotes ? NULL : entry.comment);
                 count++;
             }
         }
@@ -470,38 +472,117 @@ static int lha_cmd_add(const lha_args *args)
     lh_status st;
     lh_status err;
     int i;
+    int j;
     unsigned char *data;
     size_t len;
     lh_datetime dt;
-    char *arcname;
+    lha_file_item *items;
+    int nitems;
+    char **existing;
+    int nexist;
+    char **added;
+    int nadded;
+    int skip;
+    const char *comment;
+    lh_level level;
 
-    if (args->file_count <= 0) {
-        fprintf(stderr, "lha: no files specified\n");
+    items = NULL;
+    nitems = 0;
+    existing = NULL;
+    nexist = 0;
+    added = NULL;
+    nadded = 0;
+
+    if (!lha_collect_add_files(args->files, args->file_count, &items, &nitems)
+        || nitems <= 0) {
+        fprintf(stderr, "lha: no files matched\n");
+        lha_free_file_items(items, nitems);
         return 1;
     }
+
+    if (!g_opts.quick_add) {
+        existing = lha_archive_member_names(args->archive, &nexist);
+    }
+
     w = lh_writer_open_append(args->archive, &err);
     if (!w) {
         fprintf(stderr, "lha: cannot open %s\n", args->archive);
+        lha_free_file_items(items, nitems);
+        lha_free_paths(existing, nexist);
         return 1;
     }
-    for (i = 0; i < args->file_count; i++) {
-        if (!lha_read_file(args->files[i], &data, &len, &dt)) {
-            fprintf(stderr, "lha: cannot read %s\n", args->files[i]);
+    for (i = 0; i < nitems; i++) {
+        skip = 0;
+        if (!g_opts.quick_add) {
+            for (j = 0; j < nexist; j++) {
+                if (lha_stricmp(existing[j], items[i].arcname) == 0) {
+                    skip = 1;
+                    break;
+                }
+            }
+            if (!skip) {
+                for (j = 0; j < nadded; j++) {
+                    if (lha_stricmp(added[j], items[i].arcname) == 0) {
+                        skip = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        if (skip) {
+            fprintf(stderr,
+                "lha: warning: %s already exists in archive - skipped\n",
+                items[i].arcname);
             continue;
         }
-        arcname = lha_basename(args->files[i]);
-        lha_add_message(arcname);
-        st = lh_writer_add(w, arcname, NULL, LH_ATTR_DEFAULT, &dt,
-            g_opts.level, g_opts.store_only, data, len, NULL);
-        free(arcname);
-        free(data);
+
+        comment = g_opts.ignore_filenotes ? NULL : items[i].comment;
+        lha_add_freeze_begin(items[i].arcname);
+
+        if (items[i].is_dir) {
+            level = LH_LEVEL_LHD;
+            data = NULL;
+            len = 0;
+            lh_datetime_now(&dt);
+            st = lh_writer_add(w, items[i].arcname, comment, LH_ATTR_DEFAULT,
+                &dt, level, 1, NULL, 0, NULL);
+            lha_add_freeze_end(items[i].arcname, 1);
+        } else {
+            if (!lha_read_file(items[i].path, &data, &len, &dt)) {
+                fprintf(stderr, "lha: cannot read %s\n", items[i].path);
+                continue;
+            }
+            st = lh_writer_add(w, items[i].arcname, comment, LH_ATTR_DEFAULT,
+                &dt, g_opts.level, g_opts.store_only, data, len, NULL);
+            free(data);
+            lha_add_freeze_end(items[i].arcname, g_opts.store_only);
+        }
         if (st != LH_OK) {
             fprintf(stderr, "lha: add failed: %s\n", lh_status_string(st));
             lh_writer_close(&w);
+            lha_free_file_items(items, nitems);
+            lha_free_paths(existing, nexist);
+            lha_free_paths(added, nadded);
             return 1;
+        }
+        {
+            char **grown;
+
+            grown = (char **)realloc(added,
+                (size_t)(nadded + 1) * sizeof(char *));
+            if (grown) {
+                added = grown;
+                added[nadded] = lha_strdup(items[i].arcname);
+                if (added[nadded]) {
+                    nadded++;
+                }
+            }
         }
     }
     lh_writer_close(&w);
+    lha_free_file_items(items, nitems);
+    lha_free_paths(existing, nexist);
+    lha_free_paths(added, nadded);
     lha_operation_success();
     return 0;
 }
@@ -588,12 +669,8 @@ static int lha_cmd_concat(const lha_args *args)
     return 0;
 }
 
-int lha_run_command(const lha_args *args)
+static int lha_run_one(const lha_args *args)
 {
-    if (!args || !args->archive) {
-        return 1;
-    }
-    lh_set_debug_verbose(g_opts.debug_verbose);
     switch (args->cmd) {
     case LHA_CMD_LIST:
         return lha_cmd_list(args, 0, 0);
@@ -624,4 +701,51 @@ int lha_run_command(const lha_args *args)
     default:
         return 1;
     }
+}
+
+int lha_run_command(const lha_args *args)
+{
+    char **arcs;
+    int narc;
+    int i;
+    int rc;
+    int worst;
+    lha_args one;
+
+    if (!args || !args->archive) {
+        return 1;
+    }
+    lh_set_debug_verbose(g_opts.debug_verbose);
+
+    /*
+     * Classic LhA: archive spec may be a pattern except for `m` (move).
+     * -R walks directories; -Qw disables wildcards.  Non-wild ADD names stay
+     * literal so a new archive can be created.
+     */
+    if (args->cmd == LHA_CMD_MOVE) {
+        return lha_run_one(args);
+    }
+    if (!g_opts.recurse_archives && (g_opts.no_wildcards
+        || !lha_path_is_wild(args->archive))) {
+        return lha_run_one(args);
+    }
+
+    arcs = lha_expand_archives(args->archive, &narc);
+    if (!arcs || narc <= 0) {
+        /* ADD with a non-matching wild pattern fails; literal create is above. */
+        fprintf(stderr, "lha: no archives matched %s\n", args->archive);
+        lha_free_paths(arcs, narc);
+        return 1;
+    }
+    worst = 0;
+    for (i = 0; i < narc; i++) {
+        one = *args;
+        one.archive = arcs[i];
+        rc = lha_run_one(&one);
+        if (rc > worst) {
+            worst = rc;
+        }
+    }
+    lha_free_paths(arcs, narc);
+    return worst;
 }

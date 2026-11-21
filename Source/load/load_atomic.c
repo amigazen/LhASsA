@@ -11,6 +11,7 @@
 
 #include <exec/types.h>
 #include <exec/memory.h>
+#include <exec/ports.h>
 #include <dos/dos.h>
 #include <dos/dosextens.h>
 #include <proto/exec.h>
@@ -24,6 +25,70 @@ extern struct DosLibrary *DOSBase;
 extern struct Library *UtilityBase;
 
 #define LOAD_COPY_BUF 4096
+
+/* Public port name -- FindPort sees this; only one Load at a time. */
+#define LOAD_INSTANCE_PORT "LhASsA_Load"
+
+static struct MsgPort *load_instance_port = NULL;
+
+LONG load_claim_instance(void)
+{
+    struct MsgPort *p;
+
+    Forbid();
+    if (FindPort((STRPTR)LOAD_INSTANCE_PORT) != NULL) {
+        Permit();
+        return 0;
+    }
+    p = CreateMsgPort();
+    if (p == NULL) {
+        Permit();
+        return 0;
+    }
+    p->mp_Node.ln_Name = (char *)LOAD_INSTANCE_PORT;
+    p->mp_Node.ln_Pri = 0;
+    AddPort(p);
+    Permit();
+    load_instance_port = p;
+    return 1;
+}
+
+void load_release_instance(void)
+{
+    if (load_instance_port == NULL) {
+        return;
+    }
+    Forbid();
+    RemPort(load_instance_port);
+    Permit();
+    DeleteMsgPort(load_instance_port);
+    load_instance_port = NULL;
+}
+
+APTR load_alloc(ULONG size)
+{
+    if (size == 0) {
+        return NULL;
+    }
+    return AllocMem(size, MEMF_PUBLIC | MEMF_CLEAR);
+}
+
+void load_free(APTR p, ULONG size)
+{
+    if (p && size > 0) {
+        FreeMem(p, size);
+    }
+}
+
+STRPTR load_alloc_path(void)
+{
+    return (STRPTR)load_alloc(LOAD_PATH_LEN);
+}
+
+void load_free_path(STRPTR p)
+{
+    load_free(p, LOAD_PATH_LEN);
+}
 
 static const UWORD load_crc16_table[256] = {
     0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
@@ -121,6 +186,115 @@ LONG load_crc16_file(STRPTR path, UWORD *crc_out)
     return 1;
 }
 
+#define LOAD_FP_CHUNK 256
+
+/*
+ * Fingerprint one file: size + CRC16(head) + CRC16(tail).
+ * Returns 1 on success, 0 on I/O error.
+ */
+static LONG load_file_fingerprint(STRPTR path, LONG *size_out,
+    UWORD *head_crc, UWORD *tail_crc)
+{
+    BPTR fh;
+    UBYTE *buf;
+    LONG size;
+    LONG n;
+    LONG chunk;
+
+    if (!path || !size_out || !head_crc || !tail_crc) {
+        return 0;
+    }
+    *size_out = 0;
+    *head_crc = 0;
+    *tail_crc = 0;
+    fh = Open(path, MODE_OLDFILE);
+    if (fh == (BPTR)NULL) {
+        return 0;
+    }
+    /*
+     * Seek to end then back to start: Seek returns the previous position,
+     * so the second Seek yields the file size.
+     */
+    if (Seek(fh, 0L, OFFSET_END) < 0) {
+        Close(fh);
+        return 0;
+    }
+    size = Seek(fh, 0L, OFFSET_BEGINNING);
+    if (size < 0) {
+        Close(fh);
+        return 0;
+    }
+    *size_out = size;
+    if (size == 0) {
+        Close(fh);
+        return 1;
+    }
+    buf = (UBYTE *)AllocMem(LOAD_FP_CHUNK, MEMF_PUBLIC);
+    if (!buf) {
+        Close(fh);
+        return 0;
+    }
+    chunk = size;
+    if (chunk > LOAD_FP_CHUNK) {
+        chunk = LOAD_FP_CHUNK;
+    }
+    n = Read(fh, buf, chunk);
+    if (n != chunk) {
+        FreeMem(buf, LOAD_FP_CHUNK);
+        Close(fh);
+        return 0;
+    }
+    *head_crc = load_crc16_buf(buf, n);
+
+    if (size <= LOAD_FP_CHUNK) {
+        /* Whole file is the head; tail matches. */
+        *tail_crc = *head_crc;
+    } else {
+        if (Seek(fh, size - LOAD_FP_CHUNK, OFFSET_BEGINNING) < 0) {
+            FreeMem(buf, LOAD_FP_CHUNK);
+            Close(fh);
+            return 0;
+        }
+        n = Read(fh, buf, LOAD_FP_CHUNK);
+        if (n != LOAD_FP_CHUNK) {
+            FreeMem(buf, LOAD_FP_CHUNK);
+            Close(fh);
+            return 0;
+        }
+        *tail_crc = load_crc16_buf(buf, n);
+    }
+    FreeMem(buf, LOAD_FP_CHUNK);
+    Close(fh);
+    return 1;
+}
+
+LONG load_files_same_content(STRPTR a, STRPTR b)
+{
+    LONG sa;
+    LONG sb;
+    UWORD ah;
+    UWORD at;
+    UWORD bh;
+    UWORD bt;
+
+    if (!a || !b) {
+        return 0;
+    }
+    if (!load_file_fingerprint(a, &sa, &ah, &at)) {
+        return 0;
+    }
+    if (!load_file_fingerprint(b, &sb, &bh, &bt)) {
+        return 0;
+    }
+    if (sa != sb) {
+        return 0;
+    }
+    if (ah != bh || at != bt) {
+        return 0;
+    }
+    return 1;
+}
+
 static LONG load_path_exists(STRPTR path)
 {
     BPTR lock;
@@ -199,10 +373,7 @@ LONG load_ensure_parent(STRPTR path)
     while (buf[plen] != '\0') {
         plen++;
     }
-    if (plen == 0) {
-        return 1;
-    }
-    if (buf[plen - 1] == ':') {
+    if (plen == 0 || buf[plen - 1] == ':') {
         return 1;
     }
     lock = Lock((STRPTR)buf, ACCESS_READ);
@@ -331,6 +502,249 @@ LONG load_clear_write_protect(STRPTR path)
     return SetProtection(path, prot & ~FIBF_WRITE) ? 1 : 0;
 }
 
+/*
+ * Return 1 if path has the AmigaDOS write-protect bit set (FIBF_WRITE).
+ * Missing path => 0 (not protected).
+ */
+static LONG load_is_write_protected(STRPTR path)
+{
+    BPTR lock;
+    struct FileInfoBlock *fib;
+    LONG prot;
+    LONG wp;
+
+    lock = Lock(path, ACCESS_READ);
+    if (!lock) {
+        return 0;
+    }
+    fib = (struct FileInfoBlock *)AllocMem(
+        (ULONG)sizeof(struct FileInfoBlock), MEMF_PUBLIC | MEMF_CLEAR);
+    if (!fib) {
+        UnLock(lock);
+        return 1;
+    }
+    wp = 1;
+    if (Examine(lock, fib)) {
+        prot = fib->fib_Protection;
+        wp = ((prot & FIBF_WRITE) != 0) ? 1 : 0;
+    }
+    FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+    UnLock(lock);
+    return wp;
+}
+
+/*
+ * Exclusive ACCESS_WRITE lock probe.  Fails when another task has the
+ * object open/locked (typical for in-use .library / handlers).
+ */
+static LONG load_can_exclusive(STRPTR path)
+{
+    BPTR lock;
+
+    lock = Lock(path, ACCESS_WRITE);
+    if (!lock) {
+        return 0;
+    }
+    UnLock(lock);
+    return 1;
+}
+
+/*
+ * Fill out with the deepest existing ancestor of path (drawer or volume).
+ */
+static LONG load_existing_ancestor(STRPTR path, STRPTR out, LONG outlen)
+{
+    STRPTR fp;
+    LONG plen;
+
+    if (!path || !out || outlen <= 0) {
+        return 0;
+    }
+    Strncpy(out, path, outlen);
+    for (;;) {
+        if (load_path_exists(out)) {
+            return 1;
+        }
+        plen = 0;
+        while (out[plen] != '\0') {
+            plen++;
+        }
+        if (plen == 0) {
+            return 0;
+        }
+        if (out[plen - 1] == ':') {
+            /* Volume/assign root must exist to install into. */
+            return 0;
+        }
+        fp = FilePart(out);
+        if (!fp || fp == out) {
+            return 0;
+        }
+        if (fp > out && fp[-1] == '/') {
+            fp[-1] = '\0';
+        } else if (fp > out && fp[-1] == ':') {
+            *fp = '\0';
+        } else {
+            *fp = '\0';
+        }
+        plen = 0;
+        while (out[plen] != '\0') {
+            plen++;
+        }
+        if (plen == 0) {
+            return 0;
+        }
+    }
+}
+
+/*
+ * Log one preflight detail line.  Never opens a WB requester here -- a
+ * modal requester per file after Lock probes on LIBS:/C: was a good way
+ * to wedge Intuition.  One summary requester is raised at the end.
+ */
+static void load_preflight_note(STRPTR msg, STRPTR path)
+{
+    if (msg) {
+        Printf("Load: %s\n", (LONG)msg);
+    }
+    if (path && path[0]) {
+        Printf("Load:   %s\n", (LONG)path);
+    }
+    Flush(Output());
+}
+
+/*
+ * Preflight selected Manifest destinations before any bak/place.
+ * Refuses write-protected or locked overwrite targets, and unwritable
+ * parent drawers / missing assigns.
+ */
+LONG load_preflight(struct LoadManifest *man, STRPTR to_override)
+{
+    LONG i;
+    STRPTR dest;
+    STRPTR ancestor;
+    LONG errors;
+
+    if (!man) {
+        return 0;
+    }
+
+    dest = load_alloc_path();
+    ancestor = load_alloc_path();
+    if (!dest || !ancestor) {
+        load_free_path(dest);
+        load_free_path(ancestor);
+        load_print_error((STRPTR)"preflight: out of memory", 0);
+        return 0;
+    }
+
+    if (!load_ensure_tdir()) {
+        load_print_error((STRPTR)"preflight: cannot create SYS:T/Load", IoErr());
+        load_free_path(dest);
+        load_free_path(ancestor);
+        return 0;
+    }
+    if (load_is_write_protected((STRPTR)LOAD_TDIR)) {
+        load_print_error((STRPTR)"preflight: SYS:T/Load is write-protected", 0);
+        load_free_path(dest);
+        load_free_path(ancestor);
+        return 0;
+    }
+    if (!load_can_exclusive((STRPTR)LOAD_TDIR)) {
+        load_print_error((STRPTR)"preflight: SYS:T/Load is locked/in use", 0);
+        load_free_path(dest);
+        load_free_path(ancestor);
+        return 0;
+    }
+
+    errors = 0;
+    for (i = 0; i < man->nfiles; i++) {
+        if (!man->files[i].selected) {
+            continue;
+        }
+        if (!load_resolve_dest(dest, LOAD_PATH_LEN, man->files[i].dest,
+                to_override, man->install_root)) {
+            load_preflight_note(
+                (STRPTR)"preflight: cannot resolve destination",
+                man->files[i].dest);
+            errors++;
+            continue;
+        }
+        if (load_path_is_volume_root(dest)) {
+            load_preflight_note(
+                (STRPTR)"preflight: refusing volume root", dest);
+            errors++;
+            continue;
+        }
+
+        if (load_path_exists(dest)) {
+            if (!load_can_exclusive(dest)) {
+                load_preflight_note(
+                    (STRPTR)"preflight: destination is locked or in use",
+                    dest);
+                Printf(
+                    "Load:   close the program using it, or reboot, then retry\n",
+                    0);
+                Flush(Output());
+                errors++;
+                continue;
+            }
+            /* Ensure overwrite target is writable before bak/place. */
+            if (load_is_write_protected(dest)) {
+                if (!load_clear_write_protect(dest)) {
+                    load_preflight_note(
+                        (STRPTR)"preflight: cannot clear write-protect",
+                        dest);
+                    errors++;
+                }
+            }
+        } else {
+            if (!load_existing_ancestor(dest, ancestor, LOAD_PATH_LEN)) {
+                load_preflight_note(
+                    (STRPTR)"preflight: destination assign/path missing",
+                    dest);
+                errors++;
+                continue;
+            }
+            /*
+             * Do NOT require ACCESS_WRITE on the parent drawer.  LIBS:, C:,
+             * LOCALE:, etc. almost always have shared locks (OpenLibrary,
+             * shells, WB) so Lock(..., ACCESS_WRITE) fails even when a new
+             * file can still be created there -- and on some handlers that
+             * probe can stall.  Exclusive lock stays on the overwrite
+             * target above; here only writability matters.
+             */
+            if (load_is_write_protected(ancestor)) {
+                if (!load_clear_write_protect(ancestor)) {
+                    load_preflight_note(
+                        (STRPTR)"preflight: parent drawer write-protected",
+                        ancestor);
+                    Printf("Load:   (for %s)\n", (LONG)dest);
+                    Flush(Output());
+                    errors++;
+                }
+            }
+        }
+    }
+
+    load_free_path(dest);
+    load_free_path(ancestor);
+
+    if (errors > 0) {
+        Printf("Load: preflight failed (%ld problem(s)); nothing installed\n",
+            errors);
+        Flush(Output());
+        /* One WB requester for the whole preflight, not one per file. */
+        load_print_error(
+            (STRPTR)
+            "Preflight failed; nothing installed.\n"
+            "See the log for which paths are locked or missing.",
+            0);
+        return 0;
+    }
+    return 1;
+}
+
 LONG load_bak_path(STRPTR out, LONG outlen, STRPTR token)
 {
     char leaf[16];
@@ -380,9 +794,13 @@ LONG load_alloc_token(STRPTR token, LONG tokenlen)
     struct DateStamp ds;
     ULONG base;
     ULONG seq;
-    char bak[LOAD_PATH_LEN];
-    char side[LOAD_PATH_LEN];
+    STRPTR bak;
+    STRPTR side;
+    STRPTR cand;
     char dig[9];
+    char leaf[16];
+    LONG i;
+    LONG ok;
 
     if (!token || tokenlen < 12) {
         return 0;
@@ -390,22 +808,50 @@ LONG load_alloc_token(STRPTR token, LONG tokenlen)
     if (!load_ensure_tdir()) {
         return 0;
     }
+    bak = load_alloc_path();
+    side = load_alloc_path();
+    cand = load_alloc_path();
+    if (!bak || !side || !cand) {
+        load_free_path(bak);
+        load_free_path(side);
+        load_free_path(cand);
+        return 0;
+    }
+    ok = 0;
     DateStamp(&ds);
     base = (ULONG)((ds.ds_Days % 10000) * 100L + (ds.ds_Minute % 100));
     for (seq = 0; seq < 100; seq++) {
         load_u32_to_digits(base * 100UL + seq, dig);
         Strncpy(token, (STRPTR)dig, tokenlen);
-        if (!load_bak_path((STRPTR)bak, LOAD_PATH_LEN, token)) {
-            return 0;
+        if (!load_bak_path(bak, LOAD_PATH_LEN, token)) {
+            break;
         }
-        if (!load_sidecar_path((STRPTR)side, LOAD_PATH_LEN, token)) {
-            return 0;
+        if (!load_sidecar_path(side, LOAD_PATH_LEN, token)) {
+            break;
         }
-        if (!load_path_exists((STRPTR)bak) && !load_path_exists((STRPTR)side)) {
-            return 1;
+        /* Also require free LHc######## so cand/bak/side can share token. */
+        leaf[0] = 'L';
+        leaf[1] = 'H';
+        leaf[2] = 'c';
+        for (i = 0; dig[i] != '\0' && i < 8; i++) {
+            leaf[3 + i] = dig[i];
+        }
+        leaf[3 + i] = '\0';
+        Strncpy(cand, (STRPTR)LOAD_TDIR, LOAD_PATH_LEN);
+        if (!AddPart(cand, (STRPTR)leaf, LOAD_PATH_LEN)) {
+            break;
+        }
+        if (!load_path_exists(bak)
+            && !load_path_exists(side)
+            && !load_path_exists(cand)) {
+            ok = 1;
+            break;
         }
     }
-    return 0;
+    load_free_path(bak);
+    load_free_path(side);
+    load_free_path(cand);
+    return ok;
 }
 
 
@@ -460,6 +906,9 @@ LONG load_write_sidecar(STRPTR token, STRPTR dest, STRPTR bak,
     char side[LOAD_PATH_LEN];
     char text[512];
     LONG L;
+    LONG ok;
+    char hex[5];
+    static const char *h = "0123456789ABCDEF";
 
     if (!load_sidecar_path((STRPTR)side, LOAD_PATH_LEN, token)) {
         return 0;
@@ -473,72 +922,114 @@ LONG load_write_sidecar(STRPTR token, STRPTR dest, STRPTR bak,
     load_str_cat((STRPTR)text, 512, token);
     load_str_cat((STRPTR)text, 512, (STRPTR)"\nVer: ");
     if (ver && ver->have_ver) {
-        L = 0;
-        while (text[L] != '\0') {
-            L++;
-        }
         load_append_ulong((STRPTR)text, 512, ver->major);
         load_str_cat((STRPTR)text, 512, (STRPTR)".");
         load_append_ulong((STRPTR)text, 512, ver->minor);
     }
     load_str_cat((STRPTR)text, 512, (STRPTR)"\nCRC: ");
-    {
-        char hex[5];
-        static const char *h = "0123456789ABCDEF";
-        hex[0] = h[(crc >> 12) & 0xF];
-        hex[1] = h[(crc >> 8) & 0xF];
-        hex[2] = h[(crc >> 4) & 0xF];
-        hex[3] = h[crc & 0xF];
-        hex[4] = '\0';
-        load_str_cat((STRPTR)text, 512, (STRPTR)hex);
-    }
+    hex[0] = h[(crc >> 12) & 0xF];
+    hex[1] = h[(crc >> 8) & 0xF];
+    hex[2] = h[(crc >> 4) & 0xF];
+    hex[3] = h[crc & 0xF];
+    hex[4] = '\0';
+    load_str_cat((STRPTR)text, 512, (STRPTR)hex);
     load_str_cat((STRPTR)text, 512, (STRPTR)"\n");
     L = 0;
     while (text[L] != '\0') {
         L++;
     }
-    return load_write_file((STRPTR)side, text, L);
+    ok = load_write_file((STRPTR)side, (STRPTR)text, L);
+    return ok;
 }
 
+/*
+ * Copy live dest to SYS:T/Load as LHb######## + LHk######## sidecar.
+ * If token_out already holds a token (non-empty), reuse it so the
+ * candidate (LHc) / bak / sidecar share one id.  Otherwise allocate.
+ * On any failure, removes partial bak/sidecar and leaves dest untouched.
+ */
 LONG load_backup_to_t(STRPTR dest, STRPTR token_out, LONG tokenlen,
     STRPTR bak_out, LONG baklen)
 {
     char token[LOAD_TOKEN_LEN];
+    char side[LOAD_PATH_LEN];
     struct LoadVerInfo vi;
     UWORD crc;
+    LONG ok;
 
     if (!dest || !token_out || !bak_out) {
         return 0;
     }
-    if (!load_alloc_token((STRPTR)token, LOAD_TOKEN_LEN)) {
-        return 0;
+    ok = 0;
+    token[0] = '\0';
+    if (token_out[0] != '\0') {
+        Strncpy((STRPTR)token, token_out, LOAD_TOKEN_LEN);
+    } else {
+        if (!load_alloc_token((STRPTR)token, LOAD_TOKEN_LEN)) {
+            goto out;
+        }
     }
     if (!load_bak_path(bak_out, baklen, (STRPTR)token)) {
-        return 0;
+        goto out;
+    }
+    if (!load_sidecar_path((STRPTR)side, LOAD_PATH_LEN, (STRPTR)token)) {
+        goto out;
+    }
+    if (load_path_exists(bak_out) || load_path_exists((STRPTR)side)) {
+        goto out;
     }
     if (!load_clear_write_protect(dest)) {
-        return 0;
+        goto out;
     }
     if (!load_copy_file(dest, bak_out)) {
-        return 0;
+        DeleteFile(bak_out);
+        goto out;
     }
     if (!load_crc16_file(bak_out, &crc)) {
         DeleteFile(bak_out);
-        return 0;
+        goto out;
     }
     load_ver_scan_file(dest, &vi);
     if (!load_write_sidecar((STRPTR)token, dest, bak_out, &vi, crc)) {
         DeleteFile(bak_out);
-        return 0;
+        DeleteFile((STRPTR)side);
+        goto out;
     }
     Strncpy(token_out, (STRPTR)token, tokenlen);
-    return 1;
+    ok = 1;
+out:
+    return ok;
 }
 
 /*
  * Place candidate at dest.  bak_path may be NULL if no prior file.
  * On failure after dest deleted, restore from bak_path when present.
  */
+/*
+ * Restore dest from bak_path.  Returns 1 on success.  Dest may be missing.
+ */
+static LONG load_restore_from_bak(STRPTR dest, STRPTR bak_path)
+{
+    if (!dest || !dest[0] || !bak_path || !bak_path[0]) {
+        return 0;
+    }
+    if (!load_path_exists(bak_path)) {
+        return 0;
+    }
+    if (load_path_exists(dest)) {
+        if (!load_clear_write_protect(dest)) {
+            return 0;
+        }
+        if (!DeleteFile(dest)) {
+            return 0;
+        }
+    }
+    if (!load_copy_file(bak_path, dest)) {
+        return 0;
+    }
+    return 1;
+}
+
 LONG load_place_file(STRPTR cand, STRPTR dest, UWORD expect_crc,
     STRPTR bak_path)
 {
@@ -546,7 +1037,9 @@ LONG load_place_file(STRPTR cand, STRPTR dest, UWORD expect_crc,
     char leaf[16];
     STRPTR fp;
     UWORD crc;
-    LONG i;
+    LONG had_dest;
+    ULONG v;
+    LONG j;
 
     if (!cand || !dest) {
         return 0;
@@ -560,7 +1053,7 @@ LONG load_place_file(STRPTR cand, STRPTR dest, UWORD expect_crc,
         return 0;
     }
 
-    /* Temp sibling on dest volume: same dir, leaf LHt + 6 digits of crc/time. */
+    /* Temp sibling on dest volume: same dir, leaf LHt + 6 digits of crc. */
     Strncpy((STRPTR)temp, dest, LOAD_PATH_LEN);
     fp = FilePart((STRPTR)temp);
     if (!fp) {
@@ -569,14 +1062,10 @@ LONG load_place_file(STRPTR cand, STRPTR dest, UWORD expect_crc,
     leaf[0] = 'L';
     leaf[1] = 'H';
     leaf[2] = 't';
-    {
-        ULONG v;
-        LONG j;
-        v = (ULONG)expect_crc;
-        for (j = 5; j >= 0; j--) {
-            leaf[3 + j] = (char)('0' + (v % 10UL));
-            v /= 10UL;
-        }
+    v = (ULONG)expect_crc;
+    for (j = 5; j >= 0; j--) {
+        leaf[3 + j] = (char)('0' + (v % 10UL));
+        v /= 10UL;
     }
     leaf[9] = '\0';
     Strncpy(fp, (STRPTR)leaf, 16);
@@ -594,7 +1083,8 @@ LONG load_place_file(STRPTR cand, STRPTR dest, UWORD expect_crc,
         return 0;
     }
 
-    if (load_path_exists(dest)) {
+    had_dest = load_path_exists(dest);
+    if (had_dest) {
         if (!load_clear_write_protect(dest)) {
             DeleteFile((STRPTR)temp);
             return 0;
@@ -607,20 +1097,28 @@ LONG load_place_file(STRPTR cand, STRPTR dest, UWORD expect_crc,
     }
 
     if (!Rename((STRPTR)temp, dest)) {
-        /* Cross-volume rename cannot happen here (same dir). */
         load_print_error((STRPTR)"cannot rename temp into place", IoErr());
-        if (bak_path && bak_path[0]) {
-            load_copy_file(bak_path, dest);
-        }
         DeleteFile((STRPTR)temp);
+        if (had_dest) {
+            if (!load_restore_from_bak(dest, bak_path)) {
+                load_print_error(
+                    (STRPTR)"CRITICAL: dest removed; bak restore failed",
+                    0);
+            }
+        }
         return 0;
     }
 
     if (!load_crc16_file(dest, &crc) || crc != expect_crc) {
         load_print_error((STRPTR)"installed CRC mismatch; restoring bak", 0);
-        if (bak_path && bak_path[0]) {
+        if (had_dest) {
+            if (!load_restore_from_bak(dest, bak_path)) {
+                load_print_error(
+                    (STRPTR)"CRITICAL: bad place; bak restore failed", 0);
+            }
+        } else {
+            load_clear_write_protect(dest);
             DeleteFile(dest);
-            load_copy_file(bak_path, dest);
         }
         return 0;
     }
@@ -633,11 +1131,13 @@ static LONG load_sidecar_get_dest(STRPTR text, STRPTR dest_out, LONG destlen,
     STRPTR p;
     STRPTR line;
     char buf[512];
-    LONG i;
-    LONG n;
+    LONG ok;
 
     dest_out[0] = '\0';
     bak_out[0] = '\0';
+    if (!text) {
+        return 0;
+    }
     Strncpy((STRPTR)buf, text, 512);
     p = buf;
     while (*p) {
@@ -657,69 +1157,84 @@ static LONG load_sidecar_get_dest(STRPTR text, STRPTR dest_out, LONG destlen,
             Strncpy(bak_out, line + 5, baklen);
         }
     }
-    return (dest_out[0] && bak_out[0]) ? 1 : 0;
+    ok = (dest_out[0] && bak_out[0]) ? 1 : 0;
+    return ok;
 }
 
-LONG load_rollback_dest(STRPTR dest, ULONG quiet)
+/*
+ * Quietly restore LIBS:lh.library from the newest matching SYS:T/Load bak.
+ * Returns 1 if a bak was found and copied; 0 if none / copy failed.
+ * Does not print -- used when OpenLibrary fails at Load startup.
+ */
+LONG load_try_restore_lh_bak(void)
 {
     BPTR lock;
     struct FileInfoBlock *fib;
-    char path[LOAD_PATH_LEN];
-    char best_side[LOAD_PATH_LEN];
-    char best_bak[LOAD_PATH_LEN];
-    char best_token[LOAD_TOKEN_LEN];
-    char leaf[16];
-    char dest_got[LOAD_PATH_LEN];
-    char bak_got[LOAD_PATH_LEN];
+    STRPTR path;
+    STRPTR best_bak;
+    STRPTR dest_got;
+    STRPTR bak_got;
     APTR data;
     LONG len;
     BPTR fh;
     LONG got;
     LONG found;
+    LONG rc;
+    char best_token[LOAD_TOKEN_LEN];
+    char leaf[16];
+    static char lhdest[] = "LIBS:lh.library";
 
-    if (!dest || !dest[0]) {
-        return RETURN_FAIL;
-    }
-    if (!load_ensure_tdir()) {
-        load_print_error((STRPTR)"cannot access SYS:T/Load", IoErr());
-        return RETURN_FAIL;
+    /*
+     * path/best_bak/dest_got/bak_got are LOAD_PATH_LEN (512) each -- must
+     * not live on the stack.  best_token (16) and leaf (16) are fine there.
+     */
+    path     = load_alloc_path();
+    best_bak = load_alloc_path();
+    dest_got = load_alloc_path();
+    bak_got  = load_alloc_path();
+    if (!path || !best_bak || !dest_got || !bak_got) {
+        load_free_path(path);
+        load_free_path(best_bak);
+        load_free_path(dest_got);
+        load_free_path(bak_got);
+        return 0;
     }
 
-    best_side[0] = '\0';
-    best_bak[0] = '\0';
+    best_bak[0]   = '\0';
     best_token[0] = '\0';
-    found = 0;
+    found         = 0;
+    rc            = 0;
+    lock          = (BPTR)NULL;
+    fib           = NULL;
 
+    if (!load_ensure_tdir()) {
+        goto out;
+    }
     lock = Lock((STRPTR)LOAD_TDIR, ACCESS_READ);
     if (!lock) {
-        load_print_error((STRPTR)"no rollback directory", IoErr());
-        return RETURN_FAIL;
+        goto out;
     }
     fib = (struct FileInfoBlock *)AllocMem(
         (ULONG)sizeof(struct FileInfoBlock), MEMF_PUBLIC | MEMF_CLEAR);
     if (!fib) {
-        UnLock(lock);
-        return RETURN_FAIL;
+        goto out;
     }
     if (!Examine(lock, fib)) {
-        FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-        UnLock(lock);
-        return RETURN_FAIL;
+        goto out;
     }
     while (ExNext(lock, fib)) {
         if (fib->fib_DirEntryType > 0) {
             continue;
         }
-        /* Sidecar leaves: LHk######## */
         if (!(fib->fib_FileName[0] == 'L' && fib->fib_FileName[1] == 'H'
             && fib->fib_FileName[2] == 'k')) {
             continue;
         }
-        Strncpy((STRPTR)path, (STRPTR)LOAD_TDIR, LOAD_PATH_LEN);
-        if (!AddPart((STRPTR)path, fib->fib_FileName, LOAD_PATH_LEN)) {
+        Strncpy(path, (STRPTR)LOAD_TDIR, LOAD_PATH_LEN);
+        if (!AddPart(path, fib->fib_FileName, LOAD_PATH_LEN)) {
             continue;
         }
-        fh = Open((STRPTR)path, MODE_OLDFILE);
+        fh = Open(path, MODE_OLDFILE);
         if (fh == (BPTR)NULL) {
             continue;
         }
@@ -744,51 +1259,212 @@ LONG load_rollback_dest(STRPTR dest, ULONG quiet)
             continue;
         }
         ((char *)data)[len] = '\0';
-        if (!load_sidecar_get_dest((STRPTR)data, (STRPTR)dest_got,
-                LOAD_PATH_LEN, (STRPTR)bak_got, LOAD_PATH_LEN)) {
+        if (!load_sidecar_get_dest((STRPTR)data, dest_got,
+                LOAD_PATH_LEN, bak_got, LOAD_PATH_LEN)) {
             FreeMem(data, (ULONG)len + 1);
             continue;
         }
         FreeMem(data, (ULONG)len + 1);
-        if (Stricmp((STRPTR)dest_got, dest) != 0) {
+        if (Stricmp(dest_got, (STRPTR)lhdest) != 0) {
+            continue;
+        }
+        Strncpy((STRPTR)leaf, fib->fib_FileName + 3, 16);
+        if (!found || Stricmp((STRPTR)leaf, (STRPTR)best_token) > 0) {
+            Strncpy((STRPTR)best_token, (STRPTR)leaf, LOAD_TOKEN_LEN);
+            Strncpy(best_bak, bak_got, LOAD_PATH_LEN);
+            found = 1;
+        }
+    }
+
+    if (!found || !best_bak[0] || !load_path_exists(best_bak)) {
+        goto out;
+    }
+    if (!load_ensure_parent((STRPTR)lhdest)) {
+        goto out;
+    }
+    if (load_path_exists((STRPTR)lhdest)) {
+        load_clear_write_protect((STRPTR)lhdest);
+        DeleteFile((STRPTR)lhdest);
+    }
+    if (!load_copy_file(best_bak, (STRPTR)lhdest)) {
+        goto out;
+    }
+    rc = 1;
+
+out:
+    if (fib) {
+        FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+    }
+    if (lock) {
+        UnLock(lock);
+    }
+    load_free_path(path);
+    load_free_path(best_bak);
+    load_free_path(dest_got);
+    load_free_path(bak_got);
+    return rc;
+}
+
+LONG load_rollback_dest(STRPTR dest, ULONG quiet)
+{
+    BPTR lock;
+    struct FileInfoBlock *fib;
+    STRPTR path;
+    STRPTR best_side;
+    STRPTR best_bak;
+    STRPTR dest_got;
+    STRPTR bak_got;
+    APTR data;
+    LONG len;
+    BPTR fh;
+    LONG got;
+    LONG found;
+    LONG rc;
+    char best_token[LOAD_TOKEN_LEN];
+    char leaf[16];
+
+    /*
+     * path/best_side/best_bak/dest_got/bak_got are LOAD_PATH_LEN (512) each
+     * and must not live on the stack.  best_token (16) and leaf (16) are fine.
+     */
+    path      = load_alloc_path();
+    best_side = load_alloc_path();
+    best_bak  = load_alloc_path();
+    dest_got  = load_alloc_path();
+    bak_got   = load_alloc_path();
+    if (!path || !best_side || !best_bak || !dest_got || !bak_got) {
+        load_free_path(path);
+        load_free_path(best_side);
+        load_free_path(best_bak);
+        load_free_path(dest_got);
+        load_free_path(bak_got);
+        return RETURN_FAIL;
+    }
+
+    best_side[0]  = '\0';
+    best_bak[0]   = '\0';
+    best_token[0] = '\0';
+    found         = 0;
+    rc            = RETURN_FAIL;
+    lock          = (BPTR)NULL;
+    fib           = NULL;
+
+    if (!dest || !dest[0]) {
+        goto out;
+    }
+    if (!load_ensure_tdir()) {
+        load_print_error((STRPTR)"cannot access SYS:T/Load", IoErr());
+        goto out;
+    }
+
+    lock = Lock((STRPTR)LOAD_TDIR, ACCESS_READ);
+    if (!lock) {
+        load_print_error((STRPTR)"no rollback directory", IoErr());
+        goto out;
+    }
+    fib = (struct FileInfoBlock *)AllocMem(
+        (ULONG)sizeof(struct FileInfoBlock), MEMF_PUBLIC | MEMF_CLEAR);
+    if (!fib) {
+        goto out;
+    }
+    if (!Examine(lock, fib)) {
+        goto out;
+    }
+    while (ExNext(lock, fib)) {
+        if (fib->fib_DirEntryType > 0) {
+            continue;
+        }
+        /* Sidecar leaves: LHk######## */
+        if (!(fib->fib_FileName[0] == 'L' && fib->fib_FileName[1] == 'H'
+            && fib->fib_FileName[2] == 'k')) {
+            continue;
+        }
+        Strncpy(path, (STRPTR)LOAD_TDIR, LOAD_PATH_LEN);
+        if (!AddPart(path, fib->fib_FileName, LOAD_PATH_LEN)) {
+            continue;
+        }
+        fh = Open(path, MODE_OLDFILE);
+        if (fh == (BPTR)NULL) {
+            continue;
+        }
+        if (Seek(fh, 0L, OFFSET_END) < 0) {
+            Close(fh);
+            continue;
+        }
+        len = Seek(fh, 0L, OFFSET_BEGINNING);
+        if (len <= 0 || len > 4096) {
+            Close(fh);
+            continue;
+        }
+        data = AllocMem((ULONG)len + 1, MEMF_PUBLIC | MEMF_CLEAR);
+        if (!data) {
+            Close(fh);
+            continue;
+        }
+        got = Read(fh, data, len);
+        Close(fh);
+        if (got != len) {
+            FreeMem(data, (ULONG)len + 1);
+            continue;
+        }
+        ((char *)data)[len] = '\0';
+        if (!load_sidecar_get_dest((STRPTR)data, dest_got,
+                LOAD_PATH_LEN, bak_got, LOAD_PATH_LEN)) {
+            FreeMem(data, (ULONG)len + 1);
+            continue;
+        }
+        FreeMem(data, (ULONG)len + 1);
+        if (Stricmp(dest_got, dest) != 0) {
             continue;
         }
         /* Prefer lexicographically greatest token (latest stamp). */
         Strncpy((STRPTR)leaf, fib->fib_FileName + 3, 16);
         if (!found || Stricmp((STRPTR)leaf, (STRPTR)best_token) > 0) {
             Strncpy((STRPTR)best_token, (STRPTR)leaf, LOAD_TOKEN_LEN);
-            Strncpy((STRPTR)best_side, (STRPTR)path, LOAD_PATH_LEN);
-            Strncpy((STRPTR)best_bak, (STRPTR)bak_got, LOAD_PATH_LEN);
+            Strncpy(best_side, path, LOAD_PATH_LEN);
+            Strncpy(best_bak, bak_got, LOAD_PATH_LEN);
             found = 1;
         }
     }
-    FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
-    UnLock(lock);
 
     if (!found) {
         load_print_error((STRPTR)"no rollback bak for destination", 0);
         Printf("Load:   %s\n", (LONG)dest);
         Flush(Output());
-        return RETURN_FAIL;
+        goto out;
     }
-    if (!load_path_exists((STRPTR)best_bak)) {
+    if (!load_path_exists(best_bak)) {
         load_print_error((STRPTR)"rollback bak file missing", 0);
-        return RETURN_FAIL;
+        goto out;
     }
     if (!load_ensure_parent(dest)) {
-        return RETURN_FAIL;
+        goto out;
     }
     if (load_path_exists(dest)) {
         load_clear_write_protect(dest);
         DeleteFile(dest);
     }
-    if (!load_copy_file((STRPTR)best_bak, dest)) {
+    if (!load_copy_file(best_bak, dest)) {
         load_print_error((STRPTR)"rollback copy failed", IoErr());
-        return RETURN_FAIL;
+        goto out;
     }
     if (!quiet) {
         Printf("Load: ROLLBACK %s <- %s\n", (LONG)dest, (LONG)best_bak);
         Flush(Output());
     }
-    return RETURN_OK;
+    rc = RETURN_OK;
+
+out:
+    if (fib) {
+        FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+    }
+    if (lock) {
+        UnLock(lock);
+    }
+    load_free_path(path);
+    load_free_path(best_side);
+    load_free_path(best_bak);
+    load_free_path(dest_got);
+    load_free_path(bak_got);
+    return rc;
 }

@@ -1,0 +1,40 @@
+#
+# Source/handle/smakefile - Handle (Bin-profile LHA via lh.library)
+#
+# Prerequisite: lh.library built and installed (SDK/Include_h/proto/lh.h).
+# Links shared /common/lh_ver.o ($VER parser).
+#
+
+CC      = sc
+LD      = slink
+RM      = delete force quiet
+
+TARGET  = Handle
+OBJS    = handle.o handle_walk.o handle_manifest.o lh_ver.o
+
+all: $(TARGET)
+
+rebuild: clean all
+
+$(TARGET): $(OBJS)
+	$(LD) FROM sc:lib/c.o $(OBJS) TO $(TARGET) STRIPDEBUG NODEBUG LIB lib:small.lib sc:lib/sc.lib BATCH
+
+handle.o: handle.c handle_internal.h /common/lh_ver.h
+	$(CC) DEF=AMIGA handle.c OBJNAME=handle.o
+
+handle_walk.o: handle_walk.c handle_internal.h /common/lh_ver.h
+	$(CC) DEF=AMIGA handle_walk.c OBJNAME=handle_walk.o
+
+handle_manifest.o: handle_manifest.c handle_internal.h /common/lh_ver.h
+	$(CC) DEF=AMIGA handle_manifest.c OBJNAME=handle_manifest.o
+
+lh_ver.o: /common/lh_ver.c /common/lh_ver.h
+	$(CC) DEF=AMIGA /common/lh_ver.c OBJNAME=lh_ver.o
+
+clean:
+	-$(RM) $(OBJS)
+	-$(RM) $(TARGET)
+	-$(RM) $(TARGET).info
+
+install:
+	copy $(TARGET) C:$(TARGET)

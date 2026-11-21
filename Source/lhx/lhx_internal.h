@@ -56,7 +56,13 @@ STRPTR *lhx_expand_file_args(STRPTR *patterns, LONG *err);
 #ifndef ERROR_BREAK
 #define ERROR_BREAK 304
 #endif
+int lhx_is_wild_pattern(STRPTR pattern);
 int lhx_basename(STRPTR path, STRPTR out, LONG outlen);
+/*
+ * Stored ADD name: full path with ':' -> '/' and on-disk capitalisation,
+ * or basename if nopaths.
+ */
+int lhx_make_arcname(STRPTR path, STRPTR out, LONG outlen, LONG nopaths);
 int lhx_path_join(STRPTR out, LONG outlen, STRPTR dir, STRPTR name);
 int lhx_ensure_parent_dir(STRPTR path);
 LONG lhx_read_file(STRPTR path, APTR *data, LONG *len);

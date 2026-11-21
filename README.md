@@ -33,7 +33,7 @@ LhASsA is distributed under the [BSD 2-Clause License](LICENSE.md).
 **LhASsA** is a brand new implementation of LhA for Amiga, providing not only a command line archiving tool, but a suite of services that integrate LhA archives as a first class component of the Amiga operating system. LhASsA includes a full set of system services, as well as an SDK, consisting of:
 
 - **lh.library** - the core of LhASsA is lh.library providing archive management functions that mirror AmigaDOS file management functions, and a full set of highly optimised compression and decompression functions supporting all the major Lh algorithm variants.
-- **LhX** - a fast and lightweight Amiga-native command line tool for packing and unpacking LhA archives, that double as a Workbench DefaultTool for 
+- **LhX** - a fast AmigaDOS ReadArgs front end for packing and unpacking LhA archives; also acts as a Workbench DefaultTool for file extraction
 - **lh-handler** - an overlay filesystem that allows for accessing LhA files as if they are directories __and__ within Workbench as virtual drawers
 - **LhA** - a command line option compatible version of the original LhA command, built standalone with lh.lib and written in cross platform C to allow compiling for Linux, Mac, Windows and any other platform
 - **lh.library legacy** - the new lh.library is backwards compatible to the original functions of 1991's LhLib.lha by Holger P Krekel and Olaf 'Olsen' Barthel from 1991
@@ -43,16 +43,17 @@ LhASsA is distributed under the [BSD 2-Clause License](LICENSE.md).
 
 ## Features
 
-- **LhA 2.15-compatible** - LhASsA's new version of the LhA command itself offers the same commands, options, and console output format as the classic 2.15 version by Stefan Boberg
+- **LhA 2.15-compatible** - LhASsA's LhA command targets classic 2.15 commands, options, wildcards, home directories, and console style
 - **All lh* variants** - Compress lh0 (store only), lh1, lh5 (default), lh6, lh7;  Decompress lh0-lh7, lzs, lz4, lz5
-- **Archive operations** - add, delete, concatenate, list (`l` / `v` / `vv`), test, print, extract (`x` / `e`).
-- **Compatible** - Unlike the Amiga original, LhaSsA can process LhA files with Unix and Microsoft Windows extensions and international character file names.
+- **Archive operations** - add, delete, concatenate, list (`l` / `v` / `vv`), test, print, extract (`x` / `e`)
+- **AmigaDOS wildcards** - `#?`, `*`, and Kickstart 2.x+ patterns on filespecs and archive names; `-Qw` disables them
+- **Compatible** - Unlike the Amiga original, LhASsA can process LhA files with Unix and Microsoft Windows extensions and international character file names
 
 ## Frequently Asked Questions
 
 ### Does LhASsA's LhA command implement all classic LhA features?
 
-LhASsA targets **LHA format compatibility** and the LhA compatible front end does currently omit several LhA 2.15 features.
+LhASsA targets **LHA format compatibility** and a large subset of LhA 2.15 behaviour. Several commands and options are still missing or only partially honoured.
 
 **Commands not yet implemented**
 
@@ -65,28 +66,32 @@ LhASsA targets **LHA format compatibility** and the LhA compatible front end doe
 | `h` | Hunt (compare archive vs filesystem) |
 | `y` | Copy archive with new options |
 
-**Compression and archiving**
+**Implemented classic behaviour (LhA CLI)**
 
-- **Add progress**  -  classic `Freezing` / `Frozen(%%)` lines during compression are not shown yet (add prints `ADD name` and `Operation successful.`).
-- **lh2-lh4, lh8+**  -  recognised in headers; decompression support varies (lh5-lh7, lzs, lz4, lz5 are the main tested paths).
-- **Password-protected entries**  -  not supported.
-- **Self-extracting archives**  -  not supported.
+- **Add (`a`)** - creates/appends; skips existing members with a warning (use `u`/`f`/`r` when those land for replace). `-Qq` skips the duplicate scan
+- **Paths (`-x`)** - basename by default; `-x` stores paths with the volume stripped; `-r` enables `-x` automatically (`-x0` clears it)
+- **Home directories** - trailing `/` or `:` prefixes for path stripping; `/` resets; `-h` disables
+- **`-r`** - recursive file collect; `-e` archives empty directories as `-lhd-`
+- **`-R`** - recursive archive collect for list/extract/test/etc.
+- **Wildcards** - AmigaDOS patterns on filespecs and archive names (`m` still requires a concrete archive); `-Qw` disables
+- **Filenotes** - stored and restored as comments; `-f` ignores them
+- **Suffixes** - append `.lha`/`.lzh` when needed; `-X` never appends; `-y` always appends
+- **`ENV:LHAOPTS`** - applied at startup; `-I` ignores it
+- **Add progress** - `Freezing:` / `Frozen:` lines (packed %% not yet reported mid-compress)
 
-**Amiga platform integration**
+**LhX (AmigaDOS front end)** differs from classic `a` on purpose: ADD stores full command-line paths unless `NOPATHS`, replaces same-named members, and may expand a wild `ARCHIVE` for LIST/EXTRACT/TEST.
 
-- **Amiga `#?` wildcards**  -  to be added in a future update.
-- **Amiga filenotes** as per-file comments (and **`-f`** to ignore them when adding).
-- **Preserve file attributes** on extract (`-a`), **clear the archive (A) bit** on extract (`-C`), and **set the A bit** when adding (`-S`).
-- **Touch extracted files** with archive timestamps (`-E`).
-- **Archive empty directories** (`-e`).
-- **Recursive directory scan** (`-r`)  -  accepted for script compatibility; does not walk subdirectories.
-- **Collect archives recursively** (`-R`).
-- **Work directory** via **`-w`**  -  accepted; use `w=<dir>` for the implemented work-directory path.
-- **ENV:LHAOPTS**, **multivolume**, and other platform-only behaviours are omitted.
+**Still missing / library-limited**
+
+- **lh2-lh4, lh8+** - recognised in headers; decompression support varies (lh5-lh7, lzs, lz4, lz5 are the main tested paths)
+- **Password-protected entries** - not supported for write; reader hooks exist but are incomplete
+- **Self-extracting archives** - not supported
+- **Multivolume** (`-V` / `-Qv`) - not supported
+- **Preserve / clear / set archive bit** (`-a` / `-C` / `-S` / `-s`) and several date/confirm filters - parsed as no-ops for script compatibility
 
 **No-op command-line options**
 
-These switches are parsed and ignored (or only partially honoured) so LhA 2.15 command lines do not fail. They have no effect in LhASsA today unless noted:
+These switches are parsed and ignored (or only partially honoured) so LhA 2.15 command lines do not fail:
 
 | Option | Original purpose |
 |--------|------------------|
@@ -98,29 +103,22 @@ These switches are parsed and ignored (or only partially honoured) so LhA 2.15 c
 | `-C` | Clear archive (A) bit on extracted files |
 | `-d` | Archive date = newest file |
 | `-D` | Alternate progress display |
-| `-e` | Store empty directories |
-| `-E` | Set extracted file date/time from archive |
-| `-f` | Ignore Amiga filenotes when adding |
+| `-E` | Touch extracted files with current time |
 | `-F` | Fast progress display mode |
 | `-G` | Only extract newer files |
-| `-h` | Disable homedirectories |
 | `-i` / `-L` | Read / create file list |
-| `-I` | Ignore ENV:LHAOPTS |
 | `-k` | Keep partial extractions after errors |
 | `-K` | Kill empty directories (move) |
 | `-l` / `-u` | Lowercase / uppercase filenames |
 | `-m` | No messages for query |
-| `-M` | No autoshow files |
+| `-M` | No autoshow files (partial: `-M` / autoshow / `-Qd` exist) |
 | `-o` / `-O` | Add/extract by date |
 | `-p` | Pause after loading |
 | `-P` | Set Exec task priority |
-| `-r` | Recurse into subdirectories |
-| `-R` | Collect `.lha` archives recursively |
 | `-s` | Add only files without the A bit set |
 | `-S` | Set A bit on added files |
 | `-t` / `-T` | Only extract new / new & newer files |
 | `-V` / `-Qv` | Multivolume archive size / devices |
-| `-w` | Temporary work directory (see `w=<dir>`) |
 | `-W` | Exclude filenames |
 | `-Y` | Store big files below ratio threshold |
 | `-Z` | Compress archives inside archive |
@@ -133,12 +131,19 @@ These switches are parsed and ignored (or only partially honoured) so LhA 2.15 c
 | `-n` / `-N` | Suppress byte / all progress indicators |
 | `-F` | Accepted; fast progress path not fully differentiated |
 | `-x` | Preserve path names on add and extract |
+| `-h` | Disable home directories |
+| `-f` | Ignore filenotes on add and extract |
+| `-e` | Store empty directories when used with `-r` |
+| `-r` / `-R` | Recursive file / archive collect |
+| `-X` / `-y` | Archive suffix control |
+| `-I` / `ENV:LHAOPTS` | Ignore / apply default options |
+| `-Qq` / `-Qw` | Quick add (skip dup scan) / disable wildcards |
 | `-z` | Store uncompressed (lh0) |
 | `-0` / `-1` / `-2` | Header levels 0, 1, 2 when writing |
 | `-2` / `-3` | lh5 / lh6 compression when adding |
 | `o5` / `o6` / `o7` | Select lh5 / lh6 / lh7 method |
 | `w=<dir>` | Extract work directory |
-| File comments | Preserved on rewrite where present in archive headers |
+| File comments | Filenotes on add/extract; preserved on rewrite |
 | List totals | Archive date on totals line (Amiga `Lock`/`Examine` where available) |
 
 **LhASsA-only extensions**

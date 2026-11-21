@@ -2164,7 +2164,8 @@ static int lh_keep_not_name(const lh_entry *entry, void *ctx)
     if (!entry || !entry->filename || !name) {
         return 0;
     }
-    return strcmp(entry->filename, name) != 0;
+    /* AmigaFS case-insensitive: drop every generation of Name. */
+    return !lh_name_match(name, entry->filename);
 }
 
 LONG lh_arc_delete_entry(struct LhArchive *archive, STRPTR name)

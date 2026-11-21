@@ -51,13 +51,34 @@ unsigned short lh_crc16_update(unsigned short crc, unsigned char b)
 unsigned short lh_crc16(const unsigned char *data, size_t len)
 {
     unsigned short crc = 0;
-    size_t i;
+    const unsigned char *p;
+    const unsigned char *e;
 
     if (!data) {
         return 0;
     }
-    for (i = 0; i < len; i++) {
-        crc = lh_crc16_update(crc, data[i]);
+
+    /*
+     * Unrolled byte updates — LHA uses CRC-16 (not CRC-32), so slicing-by-8
+     * tables do not apply.  Eight updates per iteration cuts loop overhead
+     * on 680x0 without large extra tables.
+     */
+    p = data;
+    e = data + (len & ~(size_t)7);
+    while (p < e) {
+        crc = (unsigned short)((crc >> 8) ^ lh_crc16_table[(crc ^ p[0]) & 0xFF]);
+        crc = (unsigned short)((crc >> 8) ^ lh_crc16_table[(crc ^ p[1]) & 0xFF]);
+        crc = (unsigned short)((crc >> 8) ^ lh_crc16_table[(crc ^ p[2]) & 0xFF]);
+        crc = (unsigned short)((crc >> 8) ^ lh_crc16_table[(crc ^ p[3]) & 0xFF]);
+        crc = (unsigned short)((crc >> 8) ^ lh_crc16_table[(crc ^ p[4]) & 0xFF]);
+        crc = (unsigned short)((crc >> 8) ^ lh_crc16_table[(crc ^ p[5]) & 0xFF]);
+        crc = (unsigned short)((crc >> 8) ^ lh_crc16_table[(crc ^ p[6]) & 0xFF]);
+        crc = (unsigned short)((crc >> 8) ^ lh_crc16_table[(crc ^ p[7]) & 0xFF]);
+        p += 8;
+    }
+    e = data + len;
+    while (p < e) {
+        crc = (unsigned short)((crc >> 8) ^ lh_crc16_table[(crc ^ *p++) & 0xFF]);
     }
     return crc;
 }

@@ -261,7 +261,7 @@ static void lhx_wb_alert(LONG why, STRPTR archive, LONG errcode)
         es.es_Flags = 0;
         es.es_Title = (UBYTE *)"LhX";
         es.es_TextFormat = (UBYTE *)"Extraction cancelled.\nPartial files were removed.";
-        es.es_GadgetFormat = (UBYTE *)"OK";
+        es.es_GadgetFormat = (UBYTE *)"_Ok";
         EasyRequest(NULL, &es, NULL);
         return;
     }
@@ -318,7 +318,7 @@ static void lhx_wb_alert(LONG why, STRPTR archive, LONG errcode)
     es.es_Flags = 0;
     es.es_Title = (UBYTE *)"LhX";
     es.es_TextFormat = (UBYTE *)msg;
-    es.es_GadgetFormat = (UBYTE *)"OK";
+    es.es_GadgetFormat = (UBYTE *)"_Ok";
     EasyRequest(NULL, &es, NULL);
 }
 
@@ -646,7 +646,7 @@ static LONG lhx_wb_count_dir(struct LhArchive *arc, STRPTR dirpath)
     struct FileInfoBlock *fib;
     LONG count;
     LONG ok;
-    char childpath[512];
+    STRPTR childpath;
     LONG dlen;
     LONG nlen;
 
@@ -655,13 +655,22 @@ static LONG lhx_wb_count_dir(struct LhArchive *arc, STRPTR dirpath)
     if (lock == ZERO) {
         return 0;
     }
+    /* Recursive -- childpath on heap so deep trees fit in 4K. */
+    childpath = (STRPTR)AllocMem(LHX_PATH_LEN, MEMF_PUBLIC | MEMF_CLEAR);
     fib = (struct FileInfoBlock *)AllocMem(
         (ULONG)sizeof(struct FileInfoBlock), MEMF_PUBLIC | MEMF_CLEAR);
-    if (fib == NULL) {
+    if (childpath == NULL || fib == NULL) {
+        if (childpath != NULL) {
+            FreeMem(childpath, LHX_PATH_LEN);
+        }
+        if (fib != NULL) {
+            FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+        }
         LhUnLock(lock);
         return 0;
     }
     if (!LhExamine(lock, fib)) {
+        FreeMem(childpath, LHX_PATH_LEN);
         FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
         LhUnLock(lock);
         return 0;
@@ -670,26 +679,28 @@ static LONG lhx_wb_count_dir(struct LhArchive *arc, STRPTR dirpath)
     while (ok) {
         dlen = 0;
         if (dirpath != NULL && dirpath[0] != '\0') {
-            while (dirpath[dlen] != '\0' && dlen < 500) {
+            while (dirpath[dlen] != '\0' && dlen < LHX_PATH_LEN - 12) {
                 childpath[dlen] = dirpath[dlen];
                 dlen++;
             }
             childpath[dlen++] = '/';
         }
         nlen = 0;
-        while (fib->fib_FileName[nlen] != '\0' && dlen + nlen < 511) {
+        while (fib->fib_FileName[nlen] != '\0'
+                && dlen + nlen < LHX_PATH_LEN - 1) {
             childpath[dlen + nlen] = fib->fib_FileName[nlen];
             nlen++;
         }
         childpath[dlen + nlen] = '\0';
 
         if (!lhx_fib_is_file(fib)) {
-            count += lhx_wb_count_dir(arc, (STRPTR)childpath);
+            count += lhx_wb_count_dir(arc, childpath);
         } else {
             count++;
         }
         ok = LhExNext(lock, fib);
     }
+    FreeMem(childpath, LHX_PATH_LEN);
     FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
     LhUnLock(lock);
     return count;
@@ -750,7 +761,7 @@ static LONG lhx_wb_extract_dir(struct LhArchive *arc, STRPTR dirpath,
     LONG ok;
     LONG walkrc;
     LONG rc;
-    char childpath[512];
+    STRPTR childpath;
     LONG dlen;
     LONG nlen;
 
@@ -761,13 +772,22 @@ static LONG lhx_wb_extract_dir(struct LhArchive *arc, STRPTR dirpath,
     if (lock == ZERO) {
         return RETURN_FAIL;
     }
+    /* Recursive -- childpath on heap so deep trees fit in 4K. */
+    childpath = (STRPTR)AllocMem(LHX_PATH_LEN, MEMF_PUBLIC | MEMF_CLEAR);
     fib = (struct FileInfoBlock *)AllocMem(
         (ULONG)sizeof(struct FileInfoBlock), MEMF_PUBLIC | MEMF_CLEAR);
-    if (fib == NULL) {
+    if (childpath == NULL || fib == NULL) {
+        if (childpath != NULL) {
+            FreeMem(childpath, LHX_PATH_LEN);
+        }
+        if (fib != NULL) {
+            FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+        }
         LhUnLock(lock);
         return RETURN_FAIL;
     }
     if (!LhExamine(lock, fib)) {
+        FreeMem(childpath, LHX_PATH_LEN);
         FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
         LhUnLock(lock);
         return RETURN_OK;
@@ -777,21 +797,22 @@ static LONG lhx_wb_extract_dir(struct LhArchive *arc, STRPTR dirpath,
     while (ok) {
         dlen = 0;
         if (dirpath != NULL && dirpath[0] != '\0') {
-            while (dirpath[dlen] != '\0' && dlen < 500) {
+            while (dirpath[dlen] != '\0' && dlen < LHX_PATH_LEN - 12) {
                 childpath[dlen] = dirpath[dlen];
                 dlen++;
             }
             childpath[dlen++] = '/';
         }
         nlen = 0;
-        while (fib->fib_FileName[nlen] != '\0' && dlen + nlen < 511) {
+        while (fib->fib_FileName[nlen] != '\0'
+                && dlen + nlen < LHX_PATH_LEN - 1) {
             childpath[dlen + nlen] = fib->fib_FileName[nlen];
             nlen++;
         }
         childpath[dlen + nlen] = '\0';
 
         if (!lhx_fib_is_file(fib)) {
-            walkrc = lhx_wb_extract_dir(arc, (STRPTR)childpath, ctx);
+            walkrc = lhx_wb_extract_dir(arc, childpath, ctx);
             if (walkrc == RETURN_WARN) {
                 rc = RETURN_WARN;
                 break;
@@ -800,7 +821,7 @@ static LONG lhx_wb_extract_dir(struct LhArchive *arc, STRPTR dirpath,
                 rc = RETURN_ERROR;
             }
         } else {
-            walkrc = lhx_wb_extract_one(arc, (STRPTR)childpath, ctx);
+            walkrc = lhx_wb_extract_one(arc, childpath, ctx);
             if (walkrc == RETURN_WARN) {
                 rc = RETURN_WARN;
                 break;
@@ -813,6 +834,7 @@ static LONG lhx_wb_extract_dir(struct LhArchive *arc, STRPTR dirpath,
         }
         ok = LhExNext(lock, fib);
     }
+    FreeMem(childpath, LHX_PATH_LEN);
     FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
     LhUnLock(lock);
     return rc;
@@ -826,7 +848,7 @@ static void lhx_wb_rmtree(STRPTR path)
 {
     BPTR lock;
     struct FileInfoBlock *fib;
-    char child[LHX_PATH_LEN];
+    STRPTR child;
     LONG ok;
 
     if (path == NULL || path[0] == '\0') {
@@ -839,15 +861,24 @@ static void lhx_wb_rmtree(STRPTR path)
         return;
     }
 
+    /* Recursive -- child path on heap so deep trees fit in 4K. */
+    child = (STRPTR)AllocMem(LHX_PATH_LEN, MEMF_PUBLIC | MEMF_CLEAR);
     fib = (struct FileInfoBlock *)AllocMem(
         (ULONG)sizeof(struct FileInfoBlock), MEMF_PUBLIC | MEMF_CLEAR);
-    if (fib == NULL) {
+    if (child == NULL || fib == NULL) {
+        if (child != NULL) {
+            FreeMem(child, LHX_PATH_LEN);
+        }
+        if (fib != NULL) {
+            FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
+        }
         UnLock(lock);
         DeleteFile(path);
         return;
     }
 
     if (!Examine(lock, fib)) {
+        FreeMem(child, LHX_PATH_LEN);
         FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
         UnLock(lock);
         DeleteFile(path);
@@ -858,14 +889,14 @@ static void lhx_wb_rmtree(STRPTR path)
     if (fib->fib_DirEntryType > 0) {
         ok = ExNext(lock, fib);
         while (ok) {
-            if (lhx_path_join((STRPTR)child, (LONG)sizeof(child), path,
-                    fib->fib_FileName)) {
-                lhx_wb_rmtree((STRPTR)child);
+            if (lhx_path_join(child, LHX_PATH_LEN, path, fib->fib_FileName)) {
+                lhx_wb_rmtree(child);
             }
             ok = ExNext(lock, fib);
         }
     }
 
+    FreeMem(child, LHX_PATH_LEN);
     FreeMem(fib, (ULONG)sizeof(struct FileInfoBlock));
     UnLock(lock);
     DeleteFile(path);

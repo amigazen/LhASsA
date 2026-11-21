@@ -5,8 +5,12 @@
  *
  * handle_internal.h - Handle: pack a stage into a Bin-profile LHA.
  *
- * System package mode: FROM directory is named SYS (Libs/, Devs/, ...).
- * Application package mode: any other FROM directory.
+ * System package: FROM directory named SYS. Subfolders map to assigns /
+ * SYS: paths (Libs->LIBS:, Classes->SYS:Classes/, Prefs->SYS:Prefs/,
+ * Tools->SYS:Tools/, ...). Archive members use a SYS/ prefix.
+ *
+ * Application package: any other FROM name. Tree is packed as normal
+ * folder names under InstallRoot -- Libs/ SDK/ etc. are NOT remapped.
  *
  * Tags: .020 .030 .040 .060 .881 .882 .mmu .wos .pup (optional, combinable).
  * Optional staged Manifest supplies Summary/OS/Requires; File: lines generated.
@@ -23,7 +27,8 @@
 #define HANDLE_MAX_REQS 32
 #define HANDLE_VAL_LEN 256
 #define HANDLE_VER_LINE_MAX 128
-#define HANDLE_MANIFEST_MAX 12288
+/* Room for File: lines including optional Ver=maj.min(dd.mm.yy). */
+#define HANDLE_MANIFEST_MAX 16384
 
 /* Bin profile: LH0 stored member; canonical $VER line for the package. */
 #define HANDLE_BIN_PACKAGE_VER "-package.ver"
@@ -69,6 +74,12 @@ struct HandleFileVar {
     int mmu;
     int wos;
     int pup;
+    /* From staged file $VER: at pack time; emitted as File: Ver=. */
+    int have_ver;
+    int have_date;
+    ULONG major;
+    ULONG minor;
+    ULONG ymd;
 };
 
 struct HandleVerInfo {
@@ -122,6 +133,12 @@ LONG handle_build_package_ver(struct HandleScan *scan, STRPTR out, LONG outlen);
 
 LONG handle_scan_stage(struct HandleArgs *args, struct HandleScan *scan);
 LONG handle_build_manifest(struct HandleScan *scan, STRPTR out, LONG outlen);
+/*
+ * Aminet-style Load.displayme (fields + blank + install notes).
+ * Load WB uses field values as title/button; LhA autoshow shows all.
+ * outlen should be at least HANDLE_MANIFEST_MAX / 2.
+ */
+LONG handle_build_displayme(struct HandleScan *scan, STRPTR out, LONG outlen);
 
 /*
  * Locate NAME.readme beside FROM (parent), in cwd, or under FROM.

@@ -55,27 +55,41 @@ typedef struct lha_opts {
     /* LhA compatibility no-ops (cli.txt). */
     int noop_euc;
     int noop_no_progress;
-    int noop_ignore_filenotes;
+    int ignore_filenotes;   /* -f */
     int noop_fast_progress;
     int noop_extract_new;
     int noop_extract_newer;
     int noop_arc_newest_date;
     int noop_alt_progress;
     int noop_filelist;
-    int noop_ignore_lhaopts;
+    int ignore_lhaopts;     /* -I */
     int noop_compress_archives;
-    int noop_no_homedirs;
+    int no_homedirs;        /* -h */
     int noop_lower_names;
     int noop_upper_names;
     int noop_workdir_flag;
     int noop_exclude;
-    int noop_recurse;
-    int noop_recurse_archives;
+    int recurse;            /* -r collect files recursively */
+    int recurse_archives;   /* -R collect archives recursively */
     int noop_add_no_arc;
     int noop_set_arc;
     int noop_no_autoshow;
     int noop_delete_autoshow;
+    int empty_dirs;         /* -e with -r */
+    int no_suffix;          /* -X */
+    int always_suffix;      /* -y */
+    /* Wired classic options (not no-ops). */
+    int no_wildcards;   /* -Qw */
+    int quick_add;      /* -Qq: skip duplicate-member scan on add */
 } lha_opts;
+
+/* One filesystem object to add (or an empty directory with -e). */
+typedef struct lha_file_item {
+    char *path;
+    char *arcname;
+    char *comment;
+    int is_dir;
+} lha_file_item;
 
 typedef struct lha_args {
     lha_cmd cmd;
@@ -95,17 +109,49 @@ void lha_args_free(lha_args *a);
 char *lha_strdup(const char *s);
 void lha_normalize_slashes(char *s);
 char *lha_basename(const char *path);
+int lha_stricmp(const char *a, const char *b);
+int lha_path_is_wild(const char *pattern);
+/* Expand filesystem patterns (MatchFirst on Amiga). Caller frees with lha_free_paths. */
+char **lha_expand_paths(char **patterns, int count, int *out_count);
+void lha_free_paths(char **paths, int count);
+/*
+ * Archive member name for add: basename by default; with -x, path minus
+ * volume (VOL:foo/bar -> foo/bar).  Uses on-disk capitalisation when possible.
+ */
+char *lha_make_arcname(const char *path);
 int lha_path_join(char *out, size_t outsz, const char *dir, const char *name);
 int lha_mkpath(const char *path);
 int lha_match_pattern(const char *pattern, const char *name);
 int lha_name_matches_any(const char *name, char **patterns, int count);
+char **lha_archive_member_names(const char *archive, int *out_count);
+int lha_archive_has_member(const char *archive, const char *name);
 int lha_read_file(const char *path, unsigned char **data, size_t *len, lh_datetime *dt);
 int lha_write_file(const char *path, const unsigned char *data, size_t len);
 #if defined(LHA_AMIGA)
 int lha_write_file_amiga(const char *path, const unsigned char *data, size_t len);
 int lha_mkpath_amiga(const char *path);
+int lha_read_filenote(const char *path, char **out_comment);
+int lha_set_filenote(const char *path, const char *comment);
+int lha_disk_case_path_amiga(const char *path, char *out, size_t outsz);
+int lha_match_pattern_amiga(const char *pattern, const char *name);
+char **lha_expand_paths_amiga(char **patterns, int count, int *out_count);
 #endif
 void lha_apply_file_metadata(const char *path, const lh_datetime *dt, lh_attrs attrs);
+void lha_apply_file_metadata_ex(const char *path, const lh_datetime *dt,
+    lh_attrs attrs, const char *comment);
+
+/* Append .lha/.lzh per -X/-y / compression mode. Caller frees. */
+char *lha_resolve_archive_name(const char *name);
+/* Collect ADD filespecs with home dirs / -r / -e. Caller frees via lha_free_file_items. */
+int lha_collect_add_files(char **args, int argc, lha_file_item **out_items,
+    int *out_count);
+void lha_free_file_items(lha_file_item *items, int count);
+/* Expand archive pattern with optional -R recursion. Caller frees paths. */
+char **lha_expand_archives(const char *pattern, int *out_count);
+
+void lha_add_freeze_begin(const char *name);
+void lha_add_freeze_end(const char *name, int stored);
+int lha_read_lhaopts(char *buf, size_t bufsz);
 
 lh_status lha_rewrite_archive(
     const char *archive,

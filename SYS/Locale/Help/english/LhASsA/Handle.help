@@ -1,0 +1,101 @@
+   NAME
+	Handle - Pack a stage drawer into a LhASsA Parts Bin.
+
+   FORMAT
+	Handle FROM=<dir> NAME=<pkg> PRIMARY=<file> [VERSION=<ver>]
+	       [OUT=<dir>] [FORCE] [QUIET] [HELP]
+
+   TEMPLATE
+	FROM,NAME,PRIMARY,VERSION/K,OUT/K,FORCE/S,QUIET/S,HELP/S
+
+   PATH
+	C:Handle
+
+   FUNCTION
+	Handle scans a stage directory and writes NAME.bin as a Parts
+	Bin: an LHA archive with Manifest, -package.ver, Load.displayme,
+	optional NAME.readme, and the staged payload. It also writes a
+	Workbench Project icon NAME.bin.info (Parts box art) whose default
+	tool is Load so double-click opens Load's confirm requester.
+
+	Package mode is chosen from the FROM directory name:
+
+	System package (FROM named SYS)
+	    Subfolders are mapped to system destinations:
+
+	        SDK/       -> SDK:
+	        Libs/      -> LIBS:
+	        Classes/   -> SYS:Classes/   (not CLASSES:)
+	        Devs/      -> Devs:
+	        L/         -> L:
+	        C/         -> C:
+	        Prefs/     -> SYS:Prefs/     (Prefs: is not a valid assign)
+	        Tools/     -> SYS:Tools/     (Tools: is not a valid assign)
+	        Locale/    -> LOCALE:
+	        Help/      -> LOCALE:Help/  (HELP: assign target)
+	        Fonts/     -> Fonts:
+
+	    Archive members are stored under a SYS/ prefix
+	    (for example SYS/Libs/foo.library).
+
+	Application package (any other FROM name)
+	    The tree is packed as ordinary folder and file names under
+	    InstallRoot (Work:NAME/ by default, or TO= at Load time).
+	    Names such as Libs/ or SDK/ are NOT remapped to system
+	    locations -- they stay normal drawers in the app tree.
+
+	Package Version comes from PRIMARY's $VER: tag, or from
+	VERSION= when given. Each staged file is also scanned for $VER:;
+	when found it is written on that File: line as Ver=major.minor
+	or Ver=major.minor(dd.mm.yy) so Load can gate installs without
+	extracting candidates first. Data files without $VER: simply
+	omit Ver=.
+
+	Secondary name tags select CPU/FPU variants, for example
+	foo.library.020.881. Allowed tags: .020 .030 .040 .060 .881
+	.882 .mmu .wos .pup (combinable; .wos and .pup cannot combine).
+
+	Dot-prefixed names (.git, .svn, ...) are never packed.
+
+   OPTIONS
+	FROM=<dir>
+	    Stage directory to scan (required). Name it SYS for a
+	    system package; any other name for an application package.
+
+	NAME=<pkg>
+	    Package name and output base name (required). Writes
+	    NAME.bin and NAME.bin.info.
+
+	PRIMARY=<file>
+	    File under FROM (or absolute path) whose $VER: supplies the
+	    package version when VERSION= is omitted (required).
+
+	VERSION=<ver>
+	    Optional major.minor override for the package version.
+
+	OUT=<dir>
+	    Directory for the output archive (default: current dir).
+
+	FORCE
+	    Overwrite an existing output archive when present.
+
+	QUIET
+	    Reduce console output.
+
+	HELP
+	    Print this help text from HELP:<locale>/LhASsA/Handle.help
+	    (falls back to HELP:english/LhASsA/Handle.help).
+
+   EXAMPLES
+	    1> Handle FROM=SYS NAME=FooLib PRIMARY=Libs/foo.library OUT=RAM:
+
+	System package from a SYS stage; writes RAM:FooLib.bin with
+	LIBS: destinations.
+
+	    1> Handle FROM=MyAppStage NAME=MyApp PRIMARY=MyApp/MyApp VERSION=1.2
+
+	Application package; drawers kept as normal names under
+	Work:MyApp/.
+
+   SEE ALSO
+	Load, LhX, LhA

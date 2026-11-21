@@ -315,7 +315,7 @@ int lh_stream_open_write(lh_stream *s, const char *path)
         return 0;
     }
 #ifdef LH_AMIGA
-    /* aside must be heap — 560 bytes blows a typical Amiga stack frame. */
+    /* aside is 560 bytes -- large for a leaf; keep on heap. */
     for (retry = 0; retry < 4; retry++) {
         SetIoErr(0);
         fh = Open((STRPTR)path, MODE_OLDFILE);
